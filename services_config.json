@@ -1,0 +1,30 @@
+{
+  "_comment": "Synthetic test services. Start mock_azure_sidecar.py for each entry.",
+  "services": [
+    {
+      "name": "payment-service",
+      "base_url": "http://127.0.0.1:8080",
+      "enabled": true
+    },
+    {
+      "name": "user-api",
+      "base_url": "http://127.0.0.1:8081",
+      "enabled": true
+    },
+    {
+      "name": "order-processor",
+      "base_url": "http://127.0.0.1:8082",
+      "enabled": true
+    },
+    {
+      "name": "inventory-service",
+      "base_url": "http://127.0.0.1:8083",
+      "enabled": true
+    },
+    {
+      "name": "notification-worker",
+      "base_url": "http://127.0.0.1:8084",
+      "enabled": true
+    }
+  ]
+}
