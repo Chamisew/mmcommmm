@@ -2,11 +2,17 @@
    Memory Failure Detection Dashboard — Application Logic
    ========================================================================== */
 
-const API_BASE = (window.location.origin && window.location.origin.startsWith("http")) ? window.location.origin : "http://localhost:8001";
+const DEFAULT_API_BASE = (window.location.origin && window.location.origin.startsWith("http"))
+  ? window.location.origin
+  : "http://localhost:8001";
+let API_BASE = localStorage.getItem("c1_backend_url") || DEFAULT_API_BASE;
 let currentTab = "overview";
 let isSimulating = false;
 let socket = null;
 let pollTimer = null;
+let configPollTimer = null;
+let configRefreshMs = Number(localStorage.getItem("c1_config_refresh_ms")) || 1000;
+let configFileSnapshot = {};
 
 // Global State
 let pipelineData = {
@@ -26,12 +32,12 @@ let pipelineData = {
 let chartHeroMemory = null;
 let chartMemoryTrend = null;
 let chartHeapMemory = null;
-let chartMemoryDetail = null;
 let chartTrend = null;
 
 // Init Application on Load
 document.addEventListener("DOMContentLoaded", () => {
   initCharts();
+  initConfigurationPanel();
   connectBackend();
   pollTimer = setInterval(fetchBackendState, 3000);
 });
@@ -62,10 +68,34 @@ async function loadAzureServices() {
     if (!response.ok) throw new Error("Unable to load services");
     const services = await response.json();
     list.innerHTML = services.length
-      ? services.map(service => `<div class="azure-service-row"><strong>${escapeHtml(service.name)}</strong><span>${escapeHtml(service.base_url)}</span><em>${service.enabled ? "Enabled" : "Disabled"}</em></div>`).join("")
-      : "<p>No Azure services configured.</p>";
+      ? services.map(service => `
+          <div class="azure-service-row" style="display:flex; justify-content:space-between; align-items:center; padding:0.6rem; margin-bottom:0.4rem; background:rgba(255,255,255,0.03); border-radius:6px; border:1px solid rgba(255,255,255,0.08);">
+            <div>
+              <strong style="color:#e2e8f0;">${escapeHtml(service.name)}</strong>
+              <div style="font-size:0.8rem; color:#94a3b8; word-break:break-all;">${escapeHtml(service.base_url)}</div>
+              <em style="font-size:0.75rem; color:${service.enabled ? '#4ade80' : '#f87171'}">${service.enabled ? "Active" : "Disabled"}</em>
+            </div>
+            <button class="action-btn" type="button" style="padding:0.3rem 0.6rem; font-size:0.75rem; color:#f87171; border:1px solid rgba(248,113,113,0.3); background:rgba(248,113,113,0.1); border-radius:4px; cursor:pointer;" onclick="deleteAzureService('${escapeHtml(service.name)}')">Delete</button>
+          </div>
+        `).join("")
+      : "<p style='color:#94a3b8; font-size:0.85rem;'>No Azure services configured.</p>";
   } catch (error) {
     list.textContent = error.message;
+  }
+}
+
+async function deleteAzureService(name) {
+  if (!confirm(`Are you sure you want to remove '${name}' from services_config.json?`)) return;
+  try {
+    const response = await fetch(`${API_BASE}/api/azure-services/${encodeURIComponent(name)}`, {
+      method: "DELETE"
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || "Unable to delete service");
+    loadAzureServices();
+    await fetchBackendState();
+  } catch (error) {
+    alert(error.message);
   }
 }
 
@@ -93,6 +123,7 @@ async function saveAzureService(event) {
     form.reset();
     document.getElementById("azureServiceEnabled").checked = true;
     loadAzureServices();
+    await fetchBackendState();
   } catch (error) {
     message.className = "settings-message error";
     message.textContent = error.message;
@@ -163,7 +194,7 @@ function switchTab(tabId) {
   // Update sidebar nav active state
   document.querySelectorAll(".nav-item").forEach((nav, idx) => {
     nav.classList.remove("active");
-    const tabIds = ["overview", "memory", "alerts", "windows"];
+    const tabIds = ["overview", "memory", "alerts", "windows", "configuration"];
     if (idx < tabIds.length && tabIds[idx] === tabId) {
       nav.classList.add("active");
     }
@@ -175,13 +206,248 @@ function switchTab(tabId) {
     "overview": "paneOverview",
     "memory": "paneMemory",
     "alerts": "paneAlerts",
-    "windows": "paneWindows"
+    "windows": "paneWindows",
+    "configuration": "paneConfiguration"
   };
   if (paneMap[tabId]) {
     document.getElementById(paneMap[tabId])?.classList.add("active");
   }
 
+  document.querySelector(".content-scroll")?.classList.toggle("config-scroll", tabId === "configuration");
+  document.querySelector(".top-header")?.classList.toggle("config-hide-header", tabId === "configuration");
+
+  if (tabId === "configuration") {
+    reloadConfiguration();
+    startConfigPolling();
+  } else {
+    stopConfigPolling();
+  }
+
   renderStageData();
+}
+
+function initConfigurationPanel() {
+  const urlInput = document.getElementById("configBackendUrl");
+  const msInput = document.getElementById("configRefreshMs");
+  if (urlInput) urlInput.value = API_BASE;
+  if (msInput) msInput.value = String(configRefreshMs);
+}
+
+function startConfigPolling() {
+  stopConfigPolling();
+  configPollTimer = setInterval(() => {
+    if (currentTab === "configuration") reloadConfiguration();
+  }, configRefreshMs);
+}
+
+function stopConfigPolling() {
+  if (configPollTimer) {
+    clearInterval(configPollTimer);
+    configPollTimer = null;
+  }
+}
+
+function applyConnectionSettings() {
+  const urlInput = document.getElementById("configBackendUrl");
+  const msInput = document.getElementById("configRefreshMs");
+  const nextUrl = (urlInput?.value || DEFAULT_API_BASE).trim().replace(/\/$/, "");
+  const nextMs = Math.max(500, Number(msInput?.value) || 1000);
+  API_BASE = nextUrl || DEFAULT_API_BASE;
+  configRefreshMs = nextMs;
+  localStorage.setItem("c1_backend_url", API_BASE);
+  localStorage.setItem("c1_config_refresh_ms", String(configRefreshMs));
+  if (currentTab === "configuration") startConfigPolling();
+  reloadConfiguration();
+  fetchBackendState();
+}
+
+async function reloadConfiguration() {
+  const connDot = document.getElementById("configConnectionDot");
+  try {
+    const [configRes, statusRes, metricsRes] = await Promise.all([
+      fetch(`${API_BASE}/api/services-config`),
+      fetch(`${API_BASE}/api/status`),
+      fetch(`${API_BASE}/api/live-metrics?limit=500`)
+    ]);
+    if (!configRes.ok) throw new Error("Unable to load services_config.json");
+    const fileConfig = await configRes.json();
+    configFileSnapshot = fileConfig;
+
+    const statusData = statusRes.ok ? await statusRes.json() : {};
+    const metrics = metricsRes.ok ? await metricsRes.json() : [];
+
+    renderConfigurationView(fileConfig, statusData, metrics);
+    if (connDot) connDot.classList.remove("offline");
+  } catch (err) {
+    if (connDot) connDot.classList.add("offline");
+    const grid = document.getElementById("configDiscoveryGrid");
+    if (grid) grid.innerHTML = `<p class="config-empty">${escapeHtml(err.message)}</p>`;
+    const pre = document.getElementById("configJsonLive");
+    if (pre) pre.textContent = "{}";
+  }
+}
+
+function inferServicePlatform(service) {
+  const name = String(service.name || service.id || "").toLowerCase();
+  const url = String(service.base_url || "").toLowerCase();
+  if (name.includes("python") || url.includes("python")) return "python";
+  if (name.includes("node") || url.includes("node")) return "node";
+  if (name.includes("ruby") || url.includes("ruby")) return "ruby";
+  if (name.includes("go") || url.includes("-go")) return "go";
+  if (name.includes("php") || url.includes("php")) return "php";
+  if (url.includes("azurecontainerapps.io") || name.includes("azure")) return "azure";
+  if (url.includes("onrender.com") || name.includes("render")) return "render";
+  if (url.includes("railway.app")) return "railway";
+  return "service";
+}
+
+const DEVICON_BASE = "https://cdn.jsdelivr.net/gh/devicons/devicon@master/icons";
+
+function platformMeta(platform) {
+  const map = {
+    python: { label: "python", className: "platform-python", glyph: "Py", icon: `${DEVICON_BASE}/python/python-original.svg` },
+    node: { label: "node.js", className: "platform-node", glyph: "JS", icon: `${DEVICON_BASE}/nodejs/nodejs-original.svg` },
+    ruby: { label: "ruby", className: "platform-ruby", glyph: "Rb", icon: `${DEVICON_BASE}/ruby/ruby-original.svg` },
+    go: { label: "go", className: "platform-go", glyph: "Go", icon: `${DEVICON_BASE}/go/go-original.svg` },
+    php: { label: "php", className: "platform-php", glyph: "PHP", icon: `${DEVICON_BASE}/php/php-original.svg` },
+    azure: { label: "azure", className: "platform-azure", glyph: "Az", icon: `${DEVICON_BASE}/azure/azure-original.svg` },
+    render: { label: "render", className: "platform-render", glyph: "R", icon: null },
+    railway: { label: "railway", className: "platform-railway", glyph: "Rw", icon: `${DEVICON_BASE}/railway/railway-original.svg` },
+    service: { label: "service", className: "platform-generic", glyph: "S", icon: null }
+  };
+  return map[platform] || map.service;
+}
+
+function platformIconMarkup(meta) {
+  if (meta.icon) {
+    return `<img class="config-platform-img" src="${meta.icon}" alt="" width="24" height="24" loading="lazy" onerror="this.style.display='none';if(this.nextElementSibling)this.nextElementSibling.style.display='flex';"><span class="config-platform-fallback ${meta.className}" style="display:none">${meta.glyph}</span>`;
+  }
+  return `<span class="config-platform-fallback ${meta.className}">${meta.glyph}</span>`;
+}
+
+function renderConfigurationView(fileConfig, statusData, metrics) {
+  const services = Array.isArray(fileConfig.services) ? fileConfig.services : [];
+  const enabledServices = services.filter(s => s && s.enabled !== false && s.name);
+  const configuredNames = enabledServices.map(s => s.name);
+
+  const activeSet = new Set(statusData.active_containers || []);
+  const configuredSet = new Set(statusData.configured_services || configuredNames);
+  const reportingSet = new Set(
+    (metrics || []).map(m => m.service_name).filter(Boolean)
+  );
+
+  const discoveredNames = configuredNames.filter(n => activeSet.has(n) || configuredSet.has(n));
+  const reportingNames = configuredNames.filter(n => reportingSet.has(n));
+  const pendingNames = configuredNames.filter(n => !activeSet.has(n) && !reportingSet.has(n));
+
+  const discoveredCount = discoveredNames.length || (statusData.status === "running" ? configuredNames.length : 0);
+  const reportingCount = reportingNames.length;
+
+  setTextContent("configStatConfigured", String(configuredNames.length));
+  setTextContent("configStatDiscovered", String(discoveredCount));
+  setTextContent("configStatReporting", String(reportingCount));
+
+  const banner = document.getElementById("configWaitBanner");
+  if (banner) {
+    if (pendingNames.length > 0) {
+      banner.hidden = false;
+      banner.innerHTML = `Waiting for backend discovery to pick up <strong>${escapeHtml(pendingNames.join(", "))}</strong> (polls <code>services_config.json</code> every ~10s)…`;
+    } else {
+      banner.hidden = true;
+      banner.textContent = "";
+    }
+  }
+
+  const liveJson = buildLiveConfigPreview(fileConfig, enabledServices, activeSet, reportingSet);
+  const pre = document.getElementById("configJsonLive");
+  if (pre) pre.textContent = JSON.stringify(liveJson, null, 2);
+
+  const grid = document.getElementById("configDiscoveryGrid");
+  if (grid) {
+    if (!enabledServices.length) {
+      grid.innerHTML = '<p class="config-empty">No services in services_config.json yet. Use the gear icon in the header to add an Azure microservice.</p>';
+    } else {
+      grid.innerHTML = enabledServices.map(service => {
+        const name = service.name;
+        const platform = inferServicePlatform(service);
+        const meta = platformMeta(platform);
+        const isReporting = reportingSet.has(name);
+        const isDiscovered = activeSet.has(name) || configuredSet.has(name);
+        let statusLine = `${meta.label} · pending discovery`;
+        if (isReporting) statusLine = `${meta.label} · reporting telemetry`;
+        else if (isDiscovered) statusLine = `${meta.label} · discovered`;
+        const dotClass = isReporting || isDiscovered ? "ok" : "wait";
+        return `
+          <article class="config-service-card">
+            <div class="config-service-icon">${platformIconMarkup(meta)}</div>
+            <div class="config-service-body">
+              <div class="config-service-name">${escapeHtml(name)}</div>
+              <div class="config-service-status">${escapeHtml(statusLine)}</div>
+            </div>
+            <span class="config-service-dot ${dotClass}" title="${escapeHtml(statusLine)}"></span>
+          </article>
+        `;
+      }).join("");
+    }
+  }
+
+  const footer = document.getElementById("configDiscoveryFooter");
+  if (footer) {
+    footer.innerHTML = `File: services_config.json &middot; ${configuredNames.length} service(s) &mdash; discovered: ${discoveredCount} &mdash; reporting: ${reportingCount}<br>Backend discovery_task re-reads this file every 10s; no restart needed.`;
+  }
+}
+
+function buildLiveConfigPreview(fileConfig, enabledServices, activeSet, reportingSet) {
+  const comment = fileConfig._comment;
+  const services = enabledServices.map(service => {
+    const platform = inferServicePlatform(service);
+    const reporting = reportingSet.has(service.name);
+    const discovered = activeSet.has(service.name);
+    return {
+      id: service.name,
+      name: service.name,
+      base_url: service.base_url,
+      platform,
+      enabled: service.enabled !== false,
+      status: reporting ? "healthy" : discovered ? "discovered" : "pending",
+      last_checked: null
+    };
+  });
+  const out = { services };
+  if (comment) out._comment = comment;
+  return out;
+}
+
+function copyConfigJson() {
+  const text = JSON.stringify(configFileSnapshot && Object.keys(configFileSnapshot).length
+    ? configFileSnapshot
+    : {}, null, 2);
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.querySelector(".config-header-actions .config-btn:nth-child(2)");
+    if (btn) {
+      const prev = btn.textContent;
+      btn.textContent = "Copied!";
+      setTimeout(() => { btn.textContent = prev; }, 1500);
+    }
+  }).catch(() => alert("Copy failed — use Download instead."));
+}
+
+function downloadConfigJson() {
+  const text = JSON.stringify(configFileSnapshot && Object.keys(configFileSnapshot).length
+    ? configFileSnapshot
+    : { services: [] }, null, 2);
+  const blob = new Blob([text], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "services_config.json";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function setTextContent(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
 }
 
 // Connect to FastAPI backend
@@ -845,29 +1111,6 @@ function initCharts() {
     });
   }
 
-  // Memory Detail Chart (per service)
-  const ctxDetail = document.getElementById("chartMemoryDetail")?.getContext("2d");
-  if (ctxDetail) {
-    chartMemoryDetail = new Chart(ctxDetail, {
-      type: "line",
-      data: {
-        labels: [],
-        datasets: []
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        scales: {
-          x: { ticks: { color: "#64748b", maxTicksLimit: 10 }, grid: { color: "rgba(0,0,0,0.06)" } },
-          y: { ticks: { color: "#64748b" }, grid: { color: "rgba(0,0,0,0.06)" }, beginAtZero: true, max: 100 }
-        },
-        plugins: {
-          legend: { labels: { color: "#64748b" } }
-        }
-      }
-    });
-  }
-
   // Failure Trend Chart
   const ctxFailTrend = document.getElementById("chartTrend")?.getContext("2d");
   if (ctxFailTrend) {
@@ -924,28 +1167,6 @@ function updateCharts() {
     chartHeapMemory.data.labels = labels;
     chartHeapMemory.data.datasets[0].data = data;
     chartHeapMemory.update();
-  }
-
-  // Memory Detail Chart (per service)
-  if (chartMemoryDetail && metrics && metrics.length > 0) {
-    const services = [...new Set(metrics.map(m => m.service_name))];
-    const sorted = [...metrics].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-    const labels = sorted.map(m => formatTime(m.timestamp));
-    const colors = ["#2563eb", "#7c3aed", "#ea580c", "#0d9488", "#16a34a", "#dc2626"];
-    const datasets = services.map((svc, idx) => {
-      const svcMetrics = sorted.filter(m => m.service_name === svc);
-      return {
-        label: svc,
-        data: svcMetrics.map(m => m.ram_percent || 0),
-        borderColor: colors[idx % colors.length],
-        backgroundColor: "transparent",
-        tension: 0.4,
-        pointRadius: 3
-      };
-    });
-    chartMemoryDetail.data.labels = labels;
-    chartMemoryDetail.data.datasets = datasets;
-    chartMemoryDetail.update();
   }
 
   // Failure Trend Chart

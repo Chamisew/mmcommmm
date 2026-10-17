@@ -2,6 +2,65 @@
    Memory Failure Detection Dashboard — Modern Clean Theme
    ========================================================================== */
 
+:root {
+  --bg-body: #f0f4f8;
+  --bg-card: #ffffff;
+  --bg-hover: #f8fafc;
+  --bg-sidebar: #2563eb;
+  --bg-sidebar-dark: #1d4ed8;
+
+  --text-primary: #1a1a2e;
+  --text-secondary: #5f6368;
+  --text-muted: #9aa0a6;
+  --text-dim: #9aa0a6;
+
+  --accent-blue: #2563eb;
+  --accent-blue-light: #dbeafe;
+  --accent-purple: #7c3aed;
+  --accent-purple-light: #ede9fe;
+  --accent-red: #dc2626;
+  --accent-red-light: #fee2e2;
+  --accent-teal: #0d9488;
+  --accent-teal-light: #ccfbf1;
+  --accent-green: #16a34a;
+  --accent-green-light: #dcfce7;
+  --accent-orange: #ea580c;
+  --accent-orange-light: #ffedd5;
+
+  --border-color: #e2e8f0;
+  --border-light: #f1f5f9;
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.1);
+
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+
+  --font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: var(--bg-body);
+  color: var(--text-primary);
+  font-family: var(--font-family);
+  height: 100vh;
+  overflow: hidden;
+}
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
 .settings-modal {
   position: fixed;
   inset: 0;
@@ -1138,5 +1197,528 @@ body {
   }
   .detail-grid {
     grid-template-columns: 1fr;
+  }
+}
+
+/* ==========================================================================
+   CONFIGURATION TAB
+   ========================================================================== */
+.content-scroll.config-scroll {
+  background: #f8fafc;
+  padding: 1.5rem 1.75rem 2.5rem;
+}
+
+.top-header.config-hide-header {
+  display: none;
+}
+
+.config-page {
+  max-width: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1.15rem;
+}
+
+.config-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.config-title {
+  font-size: 1.55rem;
+  font-weight: 700;
+  color: #1e293b;
+  letter-spacing: -0.01em;
+  margin-bottom: 0.25rem;
+}
+
+.config-subtitle {
+  color: #64748b;
+  font-size: 0.8rem;
+  max-width: 52rem;
+  line-height: 1.45;
+}
+
+.config-subtitle code {
+  background: transparent;
+  padding: 0;
+  border: none;
+  font-family: inherit;
+  color: #475569;
+}
+
+.config-header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.config-btn {
+  border: 1px solid #d1d5db;
+  background: #ffffff;
+  color: #374151;
+  border-radius: 6px;
+  padding: 0.35rem 0.85rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+  transition: all 0.15s ease;
+}
+
+.config-btn:hover {
+  background: #f9fafb;
+  border-color: #9ca3af;
+}
+
+.config-btn-primary {
+  background: #0ea5e9;
+  border-color: #0ea5e9;
+  color: #fff;
+  box-shadow: 0 1px 2px rgba(14, 165, 233, 0.2);
+}
+
+.config-btn-primary:hover {
+  background: #0284c7;
+  border-color: #0284c7;
+}
+
+.config-stat-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1rem;
+}
+
+.config-stat-card {
+  border-radius: 8px;
+  padding: 0.75rem 1.1rem;
+  border: 1px solid #e2e8f0;
+  background: #ffffff;
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  min-height: 72px;
+  box-shadow: none;
+}
+
+.config-stat-card.configured {
+  border: none;
+  background: linear-gradient(135deg, #4f7cf6 0%, #3b82f6 100%);
+  color: #fff;
+  box-shadow: none;
+}
+
+.config-stat-card.discovered {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  box-shadow: none;
+}
+
+.config-stat-card.reporting {
+  border: none;
+  background: linear-gradient(135deg, #06b6d4 0%, #0891b2 100%);
+  color: #fff;
+  box-shadow: none;
+}
+
+.config-stat-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.config-stat-card.configured .config-stat-icon {
+  background: rgba(255, 255, 255, 0.22);
+  color: #fff;
+}
+
+.config-stat-card.discovered .config-stat-icon {
+  background: #0ea5e9;
+  color: #ffffff;
+}
+
+.config-stat-card.reporting .config-stat-icon {
+  background: rgba(255, 255, 255, 0.22);
+  color: #fff;
+}
+
+.config-stat-icon.blue { background: rgba(255, 255, 255, 0.22); color: #fff; }
+.config-stat-icon.teal { background: #0ea5e9; color: #fff; }
+.config-stat-icon.green { background: rgba(255, 255, 255, 0.22); color: #fff; }
+
+.config-stat-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.config-stat-label {
+  display: block;
+  font-size: 0.72rem;
+  color: #64748b;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.config-stat-card.configured .config-stat-label,
+.config-stat-card.reporting .config-stat-label {
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.config-stat-value {
+  font-size: 1.55rem;
+  font-weight: 700;
+  font-family: var(--font-family);
+  color: #0f172a;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+}
+
+.config-stat-card.configured .config-stat-value,
+.config-stat-card.reporting .config-stat-value {
+  color: #fff;
+}
+
+.config-wait-banner {
+  padding: 0.65rem 1rem;
+  border-radius: 6px;
+  background: #f0f9ff;
+  border: 1px solid #bae6fd;
+  color: #0369a1;
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.config-wait-banner strong {
+  color: #0284c7;
+  font-weight: 700;
+}
+
+.config-wait-banner code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  font-size: 0.8rem;
+  font-family: var(--font-mono);
+}
+
+.config-panel {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-top: 3.5px solid #06b6d4;
+  border-radius: 8px;
+  padding: 1.15rem 1.4rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.03);
+}
+
+.config-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-bottom: 0.85rem;
+}
+
+.config-panel-head h2 {
+  font-size: 0.92rem;
+  font-weight: 700;
+  color: #1e293b;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.config-panel-head h2 code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  font-family: inherit;
+  font-size: inherit;
+  font-weight: 700;
+  color: #1e293b;
+}
+
+.config-live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #10b981;
+  box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.2);
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.config-live-dot.offline {
+  background: var(--accent-red);
+  box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.2);
+}
+
+.config-discovery-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+
+.config-service-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
+  transition: all 0.15s ease;
+}
+
+.config-service-card:hover {
+  border-color: #cbd5e1;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.04);
+}
+
+.config-service-icon {
+  width: 26px;
+  height: 26px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.config-platform-img {
+  width: 22px;
+  height: 22px;
+  object-fit: contain;
+  display: block;
+}
+
+.config-platform-fallback {
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.65rem;
+  font-weight: 800;
+  color: #fff;
+  font-family: var(--font-family);
+}
+
+.platform-python { background: #3776ab; }
+.platform-node { background: #339933; }
+.platform-ruby { background: #cc0000; }
+.platform-go { background: #00add8; }
+.platform-php { background: #777bb4; }
+.platform-azure { background: #0078d4; }
+.platform-render { background: #0b192c; }
+.platform-railway { background: #0b0d0e; }
+.platform-generic { background: #64748b; }
+
+.config-service-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.config-service-name {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #0f172a;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.2;
+}
+
+.config-service-status {
+  font-size: 0.67rem;
+  color: #64748b;
+  margin-top: 0.1rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.2;
+}
+
+.config-service-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.config-service-dot.ok {
+  background: #10b981;
+  box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.18);
+}
+
+.config-service-dot.wait {
+  background: #f59e0b;
+  box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.18);
+}
+
+.config-panel-footer {
+  margin-top: 0.85rem;
+  padding-top: 0;
+  border-top: none;
+  font-size: 0.74rem;
+  color: #64748b;
+  line-height: 1.5;
+}
+
+.config-json-view {
+  margin: 0;
+  padding: 1.15rem 1.4rem;
+  border-radius: 6px;
+  background: #0f1c2e;
+  color: #e2e8f0;
+  font-family: Consolas, 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.78rem;
+  line-height: 1.55;
+  overflow-y: auto;
+  max-height: 480px;
+  white-space: pre;
+  border: 1px solid #1e293b;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.config-json-view::-webkit-scrollbar {
+  width: 8px;
+}
+
+.config-json-view::-webkit-scrollbar-track {
+  background: #0b1727;
+}
+
+.config-json-view::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 4px;
+}
+
+.config-json-view::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+.config-empty {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  padding: 0.5rem 0;
+}
+
+.config-connection-grid,
+.config-connection-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+}
+
+.config-connection-col {
+  display: flex;
+  flex-direction: column;
+}
+
+.config-connection-col label,
+.config-connection-fields label {
+  display: block;
+  font-weight: 700;
+  font-size: 0.8rem;
+  color: #1e293b;
+  margin-bottom: 0.25rem;
+}
+
+.config-field-hint {
+  font-size: 0.72rem;
+  color: #94a3b8;
+  margin-bottom: 0.65rem;
+}
+
+.config-field-spacer {
+  height: 0.72rem;
+  margin-bottom: 0.65rem;
+}
+
+.config-connection-col input,
+.config-connection-fields input {
+  width: 100%;
+  max-width: 520px;
+  padding: 0.55rem 1.25rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 9999px;
+  font-size: 0.82rem;
+  font-family: var(--font-family);
+  background: #ffffff;
+  color: #1e293b;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.config-connection-col input:focus,
+.config-connection-fields input:focus {
+  border-color: #0ea5e9;
+  box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.15);
+}
+
+.config-apply-btn {
+  background: #0ea5e9;
+  border: none;
+  color: #ffffff;
+  border-radius: 9999px;
+  padding: 0.45rem 1.6rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  align-self: flex-start;
+  margin-top: 0.85rem;
+  box-shadow: 0 1px 2px rgba(14, 165, 233, 0.2);
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+
+.config-apply-btn:hover {
+  background: #0284c7;
+}
+
+.config-apply-btn:active {
+  transform: translateY(1px);
+}
+
+@media (max-width: 1200px) {
+  .config-discovery-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 900px) {
+  .config-discovery-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 768px) {
+  .config-stat-row {
+    grid-template-columns: 1fr;
+  }
+
+  .config-connection-grid,
+  .config-connection-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .config-discovery-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .content-scroll.config-scroll {
+    padding: 1.25rem;
   }
 }

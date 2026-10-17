@@ -26,8 +26,12 @@ import pipeline
 PIPELINE_MODE = os.getenv("PIPELINE_MODE", "live")
 
 try:
-    PIPELINE_DURATION_MINUTES = int(os.getenv("PIPELINE_DURATION_MINUTES", "-1"))
-except ValueError:
+    val = str(os.getenv("PIPELINE_DURATION_MINUTES", "-1")).strip()
+    if val.lower() in ("-1", "0", "infinite", "continuous", "inf"):
+        PIPELINE_DURATION_MINUTES = -1
+    else:
+        PIPELINE_DURATION_MINUTES = int(val)
+except (ValueError, AttributeError):
     PIPELINE_DURATION_MINUTES = -1
 
 
@@ -99,6 +103,12 @@ def api_azure_services() -> list[dict[str, Any]]:
     return _read_services_config()["services"]
 
 
+@app.get("/api/services-config")
+def api_services_config() -> dict[str, Any]:
+    """Read-only view of services_config.json for the dashboard Configuration tab."""
+    return _read_services_config()
+
+
 @app.post("/api/azure-services")
 def api_add_azure_service(service: AzureServiceInput) -> dict[str, Any]:
     name = service.name.strip()
@@ -109,57 +119,92 @@ def api_add_azure_service(service: AzureServiceInput) -> dict[str, Any]:
         )
 
     base_url = str(service.base_url).rstrip("/")
+    verified = False
+    verification_notes = []
+
+    # Best-effort live check (probe /metrics and /ping or /health)
     try:
-        ping_response = requests.get(f"{base_url}/ping", timeout=5)
-        metrics_response = requests.get(f"{base_url}/metrics", timeout=5)
+        metrics_resp = requests.get(f"{base_url}/metrics", timeout=6.0)
+        if metrics_resp.status_code == 200:
+            verified = True
+            verification_notes.append("/metrics returned HTTP 200")
+        else:
+            verification_notes.append(f"/metrics returned HTTP {metrics_resp.status_code}")
     except requests.RequestException as exc:
-        raise HTTPException(status_code=400, detail=f"Azure service is unreachable: {exc}") from exc
-
-    if ping_response.status_code != 200:
-        raise HTTPException(status_code=400, detail=f"/ping returned HTTP {ping_response.status_code}; expected 200.")
-    if metrics_response.status_code != 200:
-        raise HTTPException(status_code=400, detail=f"/metrics returned HTTP {metrics_response.status_code}; expected 200.")
+        verification_notes.append(f"/metrics unreachable: {exc}")
 
     try:
-        metrics = metrics_response.json()
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="/metrics did not return valid JSON.") from exc
+        ping_resp = requests.get(f"{base_url}/ping", timeout=3.0)
+        if ping_resp.status_code == 200:
+            verification_notes.append("/ping OK")
+    except Exception:
+        pass
 
-    required_fields = {"cpu_percent", "memory_percent", "memory_used_mb"}
-    missing_fields = sorted(required_fields.difference(metrics))
-    if missing_fields:
-        raise HTTPException(
-            status_code=400,
-            detail=f"/metrics is missing required fields: {', '.join(missing_fields)}",
-        )
-
+    # Save to services_config.json dynamically without hardcoding
     config = _read_services_config()
     config["services"] = [
-        item for item in config["services"]
+        item for item in config.get("services", [])
         if isinstance(item, dict) and item.get("name") != name
     ]
     config["services"].append({"name": name, "base_url": base_url, "enabled": service.enabled})
     _write_services_config(config)
 
+    with STATE.lock:
+        if name not in STATE.active_containers and service.enabled:
+            STATE.active_containers = sorted(STATE.active_containers + [name])
+
+    msg = f"Service '{name}' saved to services_config.json."
+    if verified:
+        msg += " Endpoint verified and active."
+    else:
+        msg += f" Note: remote endpoint check: {'; '.join(verification_notes)} (will be polled when online)."
+
     return {
         "status": "saved",
+        "verified": verified,
         "service": {"name": name, "base_url": base_url, "enabled": service.enabled},
-        "message": "Service saved and verified. Restart Component 1 to reload the live collector configuration.",
+        "message": msg,
+    }
+
+
+@app.delete("/api/azure-services/{service_name}")
+def api_delete_azure_service(service_name: str) -> dict[str, Any]:
+    name = service_name.strip()
+    config = _read_services_config()
+    services_list = config.get("services", [])
+    before_len = len(services_list)
+    config["services"] = [s for s in services_list if isinstance(s, dict) and s.get("name") != name]
+
+    if len(config["services"]) == before_len:
+        raise HTTPException(status_code=404, detail=f"Service '{name}' not found in services_config.json.")
+
+    _write_services_config(config)
+    with STATE.lock:
+        STATE.active_containers = [s for s in STATE.active_containers if s != name]
+    return {
+        "status": "deleted",
+        "service_name": name,
+        "message": f"Service '{name}' removed from services_config.json.",
     }
 
 
 
 def _sanitize_value(v: Any) -> Any:
-    if isinstance(v, pd.Timestamp):
-        return v.isoformat()
-    if isinstance(v, datetime):
-        return v.isoformat()
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
     if isinstance(v, (np.floating, float)):
+        if np.isinf(v) or np.isnan(v):
+            return None
         return float(v)
     if isinstance(v, (np.integer, int)):
         return int(v)
-    if pd.isna(v):
-        return None
+    if isinstance(v, (pd.Timestamp, datetime)):
+        return v.isoformat()
     return v
 
 
@@ -218,25 +263,34 @@ def _pipeline_worker() -> None:
     if mode == "live":
         # Start pipeline collector in a separate daemon thread with exception handling
         def run_collector():
-            try:
-                duration_minutes = PIPELINE_DURATION_MINUTES
-                if hasattr(pipeline, "stage1_collect_azure_sidecar"):
-                    pipeline.CONFIG["live_duration_minutes"] = duration_minutes
-                    pipeline.stage1_collect_azure_sidecar(duration_minutes=duration_minutes)
-                elif hasattr(pipeline, "stage1_collect_live"):
-                    cfg = dict(pipeline.CONFIG)
-                    cfg["live_duration_minutes"] = duration_minutes
-                    pipeline.stage1_collect_live(duration_minutes=duration_minutes)
+            while True:
+                try:
+                    duration_minutes = PIPELINE_DURATION_MINUTES
+                    if hasattr(pipeline, "stage1_collect_azure_sidecar"):
+                        pipeline.CONFIG["live_duration_minutes"] = duration_minutes
+                        pipeline.stage1_collect_azure_sidecar(duration_minutes=duration_minutes)
+                    elif hasattr(pipeline, "stage1_collect_live"):
+                        cfg = dict(pipeline.CONFIG)
+                        cfg["live_duration_minutes"] = duration_minutes
+                        pipeline.stage1_collect_live(duration_minutes=duration_minutes)
+                    else:
+                        raise AttributeError("No live collector exists in pipeline.py")
+                except SystemExit as se:
+                    with STATE.lock:
+                        STATE.status = "stopped"
+                        STATE.last_error = f"Collector thread exited (SystemExit: {se.code})"
+                    break
+                except BaseException as exc:
+                    with STATE.lock:
+                        STATE.status = "stopped"
+                        STATE.last_error = f"Collector thread failed: {str(exc)}"
+
+                # If a finite duration was specified, continue collecting in cycles so backend runs continuously
+                if PIPELINE_DURATION_MINUTES > 0:
+                    print(f"\n  [INFO] Completed {PIPELINE_DURATION_MINUTES}m collection cycle. Continuing live collection...")
+                    time.sleep(2)
                 else:
-                    raise AttributeError("No live collector exists in pipeline.py")
-            except SystemExit as se:
-                with STATE.lock:
-                    STATE.status = "stopped"
-                    STATE.last_error = f"Collector thread exited (SystemExit: {se.code})"
-            except BaseException as exc:
-                with STATE.lock:
-                    STATE.status = "stopped"
-                    STATE.last_error = f"Collector thread failed: {str(exc)}"
+                    break
 
         collector_thread = threading.Thread(target=run_collector, daemon=True)
         collector_thread.start()
@@ -246,14 +300,27 @@ def _pipeline_worker() -> None:
             with pipeline.pipeline_state_lock:
                 raw_df = pipeline.pipeline_state.get("raw_df")
                 win_df = pipeline.pipeline_state.get("windows_df")
-                
+                pipe_configured = pipeline.pipeline_state.get("configured_services", [])
+
+            try:
+                file_configured = [
+                    s["name"] for s in _read_services_config().get("services", [])
+                    if isinstance(s, dict) and s.get("name") and s.get("enabled", True)
+                ]
+            except Exception:
+                file_configured = []
+
+            all_configured = sorted(set(pipe_configured) | set(file_configured))
+
             with STATE.lock:
                 if raw_df is not None and not raw_df.empty:
                     STATE.raw_rows = _df_to_records(raw_df)
                     STATE.total_rows_collected = len(STATE.raw_rows)
-                    STATE.active_containers = sorted(
-                        list({r.get("service_name") for r in STATE.raw_rows if r.get("service_name")})
-                    )
+                    data_seen = {r.get("service_name") for r in STATE.raw_rows if r.get("service_name")}
+                    STATE.active_containers = sorted(set(all_configured) | data_seen)
+                elif all_configured:
+                    STATE.active_containers = all_configured
+
                 if win_df is not None and not win_df.empty:
                     STATE.windows_rows = _df_to_records(win_df)
                     STATE.total_windows_generated = len(STATE.windows_rows)
@@ -319,7 +386,17 @@ def on_startup() -> None:
 
 @app.get("/api/status")
 def api_status() -> dict[str, Any]:
+    try:
+        configured = [
+            s["name"] for s in _read_services_config().get("services", [])
+            if isinstance(s, dict) and s.get("name") and s.get("enabled", True)
+        ]
+    except Exception:
+        configured = []
+
     with STATE.lock:
+        data_seen = {r.get("service_name") for r in STATE.raw_rows if r.get("service_name")}
+        merged_services = sorted(set(configured) | set(STATE.active_containers) | data_seen)
         return {
             "status": STATE.status,
             "mode": STATE.mode,
@@ -327,7 +404,8 @@ def api_status() -> dict[str, Any]:
             "total_rows_collected": STATE.total_rows_collected,
             "total_windows_generated": STATE.total_windows_generated,
             "last_global_window_id": STATE.last_global_window_id,
-            "active_containers": STATE.active_containers,
+            "active_containers": merged_services,
+            "configured_services": configured,
             "last_error": STATE.last_error,
         }
 
@@ -352,7 +430,8 @@ def api_live_metrics(limit: int = Query(default=50, ge=1, le=500)) -> list[dict[
     cols = [
         "service_name", "stack", "timestamp", "ram_percent", "cpu_percent",
         "heap_mb_used", "gc_count", "log_level", "log_message",
-        "hybrid_label", "failure_type", "detection_layer", "log_template",
+        "hybrid_label", "raw_hybrid_label", "ground_truth_label", "failure_type",
+        "detection_layer", "log_template", "confidence",
     ]
     for c in cols:
         if c not in recent.columns:
@@ -365,16 +444,17 @@ def api_live_metrics(limit: int = Query(default=50, ge=1, le=500)) -> list[dict[
             ram = float(row.get("ram_percent") or 0.0)
             cpu = float(row.get("cpu_percent") or 0.0)
             msg = str(row.get("log_message") or "").upper()
+            ram_thresh = getattr(pipeline, "RAM_FAILURE_THRESHOLD", 85.0)
             is_fail = (
-                ram >= 80.0
+                ram >= ram_thresh
                 or any(k in msg for k in getattr(pipeline, "MEMORY_KEYWORDS", []))
             )
             if is_fail:
                 recent.at[idx, "hybrid_label"] = "FAILURE"
                 ft = "none"
-                if ram >= 90.0 or "OOM" in msg or "OUT OF MEMORY" in msg:
+                if ram >= ram_thresh or "OOM" in msg or "OUT OF MEMORY" in msg:
                     ft = "oom"
-                elif "LEAK" in msg or ram >= 70.0:
+                elif "LEAK" in msg or ram >= ram_thresh * 0.85:
                     ft = "memory_leak"
                 elif "GC" in msg or "OVERHEAD" in msg:
                     ft = "gc_overhead"
@@ -394,7 +474,7 @@ def api_live_metrics(limit: int = Query(default=50, ge=1, le=500)) -> list[dict[
 def api_windows(limit: int = Query(default=50, ge=1, le=1000)) -> list[dict[str, Any]]:
     with STATE.lock:
         if STATE.windows_rows:
-            return STATE.windows_rows[-limit:]
+            return [{k: _sanitize_value(v) for k, v in row.items()} for row in STATE.windows_rows[-limit:]]
 
     # Fallback to output/pipeline_output.csv so dashboard always has window data
     try:
@@ -409,7 +489,9 @@ def api_windows(limit: int = Query(default=50, ge=1, le=1000)) -> list[dict[str,
                         STATE.windows_rows = records
                         STATE.total_windows_generated = len(df)
                         if "window_id" in df.columns:
-                            STATE.last_global_window_id = int(df["window_id"].max())
+                            valid_ids = pd.to_numeric(df["window_id"], errors="coerce").dropna()
+                            if not valid_ids.empty:
+                                STATE.last_global_window_id = int(valid_ids.max())
                 return records
     except Exception:
         pass
@@ -426,16 +508,9 @@ def api_templates() -> list[dict[str, Any]]:
     if raw_df.empty:
         return []
 
-    # If log_template is missing or empty, extract or parse templates
-    if "log_template" not in raw_df.columns or raw_df["log_template"].dropna().empty:
-        try:
-            if hasattr(pipeline, "stage2_drain3_parsing"):
-                parsed = pipeline.stage2_drain3_parsing(raw_df.copy(), pipeline.CONFIG)
-                if "log_template" in parsed.columns:
-                    raw_df["log_template"] = parsed["log_template"]
-        except Exception:
-            pass
-
+    # Do not invoke Stage 2 here. The live collector may be processing the
+    # same snapshot concurrently; reparsing on every dashboard poll causes
+    # repeated Drain3 runs and concurrent writes to the persisted model.
     if "log_template" not in raw_df.columns or raw_df["log_template"].dropna().empty:
         if "log_message" in raw_df.columns:
             raw_df["log_template"] = raw_df["log_message"].apply(
@@ -444,16 +519,27 @@ def api_templates() -> list[dict[str, Any]]:
         else:
             return []
 
-    grouped = (
-        raw_df.groupby("log_template")
-        .agg(
-            count=("log_template", "size"),
-            failure_related=("hybrid_label", lambda s: bool((s == "FAILURE").any())),
+    if "hybrid_label" in raw_df.columns:
+        grouped = (
+            raw_df.groupby("log_template")
+            .agg(
+                count=("log_template", "size"),
+                failure_related=("hybrid_label", lambda s: bool((s == "FAILURE").any())),
+            )
+            .reset_index()
+            .sort_values("count", ascending=False)
+            .head(20)
         )
-        .reset_index()
-        .sort_values("count", ascending=False)
-        .head(20)
-    )
+    else:
+        grouped = (
+            raw_df.groupby("log_template")
+            .size()
+            .rename("count")
+            .reset_index()
+            .assign(failure_related=False)
+            .sort_values("count", ascending=False)
+            .head(20)
+        )
     grouped.rename(columns={"log_template": "template"}, inplace=True)
     return _df_to_records(grouped[["template", "count", "failure_related"]])
 
@@ -476,8 +562,13 @@ def api_stats() -> dict[str, Any]:
         wdf = pd.DataFrame(STATE.windows_rows)
 
     total_windows = len(wdf)
-    failure_windows = int((wdf["hybrid_label"] == "FAILURE").sum())
-    normal_windows = total_windows - failure_windows
+    # Use ground_truth_label for counts when available, otherwise hybrid_label
+    if "ground_truth_label" in wdf.columns and wdf["ground_truth_label"].isin(["FAILURE", "NORMAL"]).any():
+        failure_windows = int((wdf["ground_truth_label"] == "FAILURE").sum())
+        normal_windows = int((wdf["ground_truth_label"] == "NORMAL").sum())
+    else:
+        failure_windows = int((wdf["hybrid_label"] == "FAILURE").sum())
+        normal_windows = total_windows - failure_windows
     failure_percent = (failure_windows / total_windows * 100.0) if total_windows > 0 else 0.0
 
     layers = wdf["detection_layer"].astype(str)
@@ -554,7 +645,7 @@ def api_component3_feed(since_window_id: int = Query(default=0, ge=0)) -> dict[s
         if "memory_change_5min" not in new_df.columns:
             new_df = pipeline.build_ml_dataframe(new_df)
         elif "project_id" not in new_df.columns:
-            new_df["project_id"] = new_df["stack"].apply(pipeline.get_project_id)
+            new_df["project_id"] = new_df["service_name"].apply(pipeline.get_project_id)
         if "label" not in new_df.columns and "hybrid_label" in new_df.columns:
             new_df["label"] = new_df["hybrid_label"]
             
@@ -566,8 +657,10 @@ def api_component3_feed(since_window_id: int = Query(default=0, ge=0)) -> dict[s
         ew = dict(w)
         
         # Populate project_id and label/hybrid_label
-        if "project_id" not in ew and "stack" in ew:
-            ew["project_id"] = pipeline.get_project_id(ew["stack"])
+        if "project_id" not in ew or not ew["project_id"] or pd.isna(ew["project_id"]):
+            svc = ew.get("service_name") or ew.get("stack")
+            if svc:
+                ew["project_id"] = pipeline.get_project_id(svc)
         if "label" not in ew and "hybrid_label" in ew:
             ew["label"] = ew["hybrid_label"]
         elif "hybrid_label" not in ew and "label" in ew:
@@ -599,11 +692,12 @@ def api_component3_feed(since_window_id: int = Query(default=0, ge=0)) -> dict[s
         elif "trend_variance" not in ew:
             ew["trend_variance"] = None
             
-        enriched_windows.append(ew)
+        sanitized_ew = {k: _sanitize_value(v) for k, v in ew.items()}
+        enriched_windows.append(sanitized_ew)
 
     last_window_id = since_window_id
     if enriched_windows:
-        last_window_id = int(max(w.get("window_id", since_window_id) for w in enriched_windows))
+        last_window_id = int(max((w.get("window_id") or since_window_id) for w in enriched_windows))
 
     return {
         "last_window_id": last_window_id,
