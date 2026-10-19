@@ -69,10 +69,12 @@ SERVICES_CONFIG_PATH = Path(__file__).resolve().parent / "services_config.json"
 SERVICE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
-class AzureServiceInput(BaseModel):
+class MonitoredServiceInput(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     base_url: HttpUrl
     enabled: bool = True
+
+AzureServiceInput = MonitoredServiceInput
 
 
 def _read_services_config() -> dict[str, Any]:
@@ -98,9 +100,12 @@ def _write_services_config(config: dict[str, Any]) -> None:
         raise HTTPException(status_code=500, detail=f"Cannot save services configuration: {exc}") from exc
 
 
+@app.get("/api/monitored-services")
 @app.get("/api/azure-services")
-def api_azure_services() -> list[dict[str, Any]]:
+def api_monitored_services() -> list[dict[str, Any]]:
     return _read_services_config()["services"]
+
+api_azure_services = api_monitored_services
 
 
 @app.get("/api/services-config")
@@ -109,8 +114,9 @@ def api_services_config() -> dict[str, Any]:
     return _read_services_config()
 
 
+@app.post("/api/monitored-services")
 @app.post("/api/azure-services")
-def api_add_azure_service(service: AzureServiceInput) -> dict[str, Any]:
+def api_add_monitored_service(service: MonitoredServiceInput) -> dict[str, Any]:
     name = service.name.strip()
     if not SERVICE_NAME_PATTERN.fullmatch(name):
         raise HTTPException(
@@ -122,10 +128,10 @@ def api_add_azure_service(service: AzureServiceInput) -> dict[str, Any]:
     verified = False
     verification_notes = []
 
-    # Best-effort live check (probe /metrics and /ping or /health)
+    # Best-effort live check (probe /metrics and /health with /ping fallback)
     try:
         metrics_resp = requests.get(f"{base_url}/metrics", timeout=6.0)
-        if metrics_resp.status_code == 200:
+        if 200 <= metrics_resp.status_code < 300:
             verified = True
             verification_notes.append("/metrics returned HTTP 200")
         else:
@@ -133,12 +139,22 @@ def api_add_azure_service(service: AzureServiceInput) -> dict[str, Any]:
     except requests.RequestException as exc:
         verification_notes.append(f"/metrics unreachable: {exc}")
 
-    try:
-        ping_resp = requests.get(f"{base_url}/ping", timeout=3.0)
-        if ping_resp.status_code == 200:
-            verification_notes.append("/ping OK")
-    except Exception:
-        pass
+    # Health check via _check_service_health (/health first, then /ping fallback)
+    if hasattr(pipeline, "_check_service_health"):
+        is_healthy, health_note = pipeline._check_service_health(base_url, timeout=3.0)
+        if is_healthy:
+            verification_notes.append(health_note)
+        else:
+            verification_notes.append(f"health check: {health_note}")
+    else:
+        for ep in ("/health", "/ping"):
+            try:
+                h_resp = requests.get(f"{base_url}{ep}", timeout=3.0)
+                if 200 <= h_resp.status_code < 300:
+                    verification_notes.append(f"{ep} OK")
+                    break
+            except requests.RequestException:
+                pass
 
     # Save to services_config.json dynamically without hardcoding
     config = _read_services_config()
@@ -166,9 +182,12 @@ def api_add_azure_service(service: AzureServiceInput) -> dict[str, Any]:
         "message": msg,
     }
 
+api_add_azure_service = api_add_monitored_service
 
+
+@app.delete("/api/monitored-services/{service_name}")
 @app.delete("/api/azure-services/{service_name}")
-def api_delete_azure_service(service_name: str) -> dict[str, Any]:
+def api_delete_monitored_service(service_name: str) -> dict[str, Any]:
     name = service_name.strip()
     config = _read_services_config()
     services_list = config.get("services", [])
@@ -186,6 +205,8 @@ def api_delete_azure_service(service_name: str) -> dict[str, Any]:
         "service_name": name,
         "message": f"Service '{name}' removed from services_config.json.",
     }
+
+api_delete_azure_service = api_delete_monitored_service
 
 
 
@@ -217,6 +238,58 @@ def _df_to_records(df: pd.DataFrame) -> list[dict[str, Any]]:
     return records
 
 
+def _prepare_metric_records(df: pd.DataFrame, limit: int = 500) -> list[dict[str, Any]]:
+    if df is None or df.empty:
+        return []
+    working_df = df.tail(limit).copy()
+    if "timestamp" in working_df.columns:
+        working_df["timestamp"] = pd.to_datetime(working_df["timestamp"], errors="coerce")
+        working_df = working_df.sort_values("timestamp", ascending=False)
+
+    cols = [
+        "service_name", "stack", "timestamp", "ram_percent", "cpu_percent",
+        "heap_mb_used", "gc_count", "log_level", "log_message",
+        "hybrid_label", "raw_hybrid_label", "ground_truth_label", "failure_type",
+        "detection_layer", "log_template", "confidence",
+    ]
+    for c in cols:
+        if c not in working_df.columns:
+            working_df[c] = None
+
+    ram_thresh = getattr(pipeline, "RAM_FAILURE_THRESHOLD", 85.0)
+    keywords = getattr(pipeline, "MEMORY_KEYWORDS", [])
+
+    for idx, row in working_df.iterrows():
+        lbl = row.get("hybrid_label")
+        if pd.isna(lbl) or lbl is None:
+            ram = float(row.get("ram_percent") or 0.0)
+            cpu = float(row.get("cpu_percent") or 0.0)
+            msg = str(row.get("log_message") or "").upper()
+            is_fail = (
+                ram >= ram_thresh
+                or any(k in msg for k in keywords)
+            )
+            if is_fail:
+                working_df.at[idx, "hybrid_label"] = "FAILURE"
+                ft = "none"
+                if ram >= ram_thresh or "OOM" in msg or "OUT OF MEMORY" in msg:
+                    ft = "oom"
+                elif "LEAK" in msg or ram >= ram_thresh * 0.85:
+                    ft = "memory_leak"
+                elif "GC" in msg or "OVERHEAD" in msg:
+                    ft = "gc_overhead"
+                else:
+                    ft = "memory_pressure"
+                working_df.at[idx, "failure_type"] = ft
+                working_df.at[idx, "detection_layer"] = "keyword"
+            else:
+                working_df.at[idx, "hybrid_label"] = "NORMAL"
+                working_df.at[idx, "failure_type"] = "none"
+                working_df.at[idx, "detection_layer"] = "none"
+
+    return _df_to_records(working_df[cols])
+
+
 def _run_pipeline_once(mode: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Run stage sequence once and return (raw_df, windows_df)."""
     cfg = dict(pipeline.CONFIG)
@@ -224,10 +297,14 @@ def _run_pipeline_once(mode: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         if hasattr(pipeline, "stage1_load_data"):
             raw_df = pipeline.stage1_load_data(cfg)
         else:
-            raise RuntimeError("CSV mode is not supported in the Azure refactor. Set PIPELINE_MODE=live.")
+            raise RuntimeError("CSV mode is not supported in live mode. Set PIPELINE_MODE=live.")
     else:
         duration_minutes = cfg.get("live_duration_minutes", PIPELINE_DURATION_MINUTES)
-        if hasattr(pipeline, "stage1_collect_azure_sidecar"):
+        if hasattr(pipeline, "stage1_collect_monitored_services"):
+            raw_df = pipeline.stage1_collect_monitored_services(
+                duration_minutes=duration_minutes
+            )
+        elif hasattr(pipeline, "stage1_collect_azure_sidecar"):
             raw_df = pipeline.stage1_collect_azure_sidecar(
                 duration_minutes=duration_minutes
             )
@@ -236,7 +313,7 @@ def _run_pipeline_once(mode: str) -> tuple[pd.DataFrame, pd.DataFrame]:
                 duration_minutes=duration_minutes
             )
         else:
-            raise AttributeError("No Azure or legacy live collector is available in pipeline.py")
+            raise AttributeError("No monitored services or legacy live collector is available in pipeline.py")
 
     if raw_df.empty:
         return raw_df, pd.DataFrame()
@@ -266,7 +343,10 @@ def _pipeline_worker() -> None:
             while True:
                 try:
                     duration_minutes = PIPELINE_DURATION_MINUTES
-                    if hasattr(pipeline, "stage1_collect_azure_sidecar"):
+                    if hasattr(pipeline, "stage1_collect_monitored_services"):
+                        pipeline.CONFIG["live_duration_minutes"] = duration_minutes
+                        pipeline.stage1_collect_monitored_services(duration_minutes=duration_minutes)
+                    elif hasattr(pipeline, "stage1_collect_azure_sidecar"):
                         pipeline.CONFIG["live_duration_minutes"] = duration_minutes
                         pipeline.stage1_collect_azure_sidecar(duration_minutes=duration_minutes)
                     elif hasattr(pipeline, "stage1_collect_live"):
@@ -314,18 +394,23 @@ def _pipeline_worker() -> None:
 
             with STATE.lock:
                 if raw_df is not None and not raw_df.empty:
-                    STATE.raw_rows = _df_to_records(raw_df)
-                    STATE.total_rows_collected = len(STATE.raw_rows)
+                    STATE.raw_rows = _prepare_metric_records(raw_df, limit=500)
+                    STATE.total_rows_collected = len(raw_df)
                     data_seen = {r.get("service_name") for r in STATE.raw_rows if r.get("service_name")}
                     STATE.active_containers = sorted(set(all_configured) | data_seen)
                 elif all_configured:
                     STATE.active_containers = all_configured
 
                 if win_df is not None and not win_df.empty:
-                    STATE.windows_rows = _df_to_records(win_df)
-                    STATE.total_windows_generated = len(STATE.windows_rows)
+                    STATE.windows_rows = _df_to_records(win_df.tail(200))
+                    STATE.total_windows_generated = len(win_df)
                     if "window_id" in win_df.columns:
-                        STATE.last_global_window_id = int(win_df["window_id"].max())
+                        try:
+                            valid_ids = pd.to_numeric(win_df["window_id"], errors="coerce").dropna()
+                            if not valid_ids.empty:
+                                STATE.last_global_window_id = int(valid_ids.max())
+                        except Exception:
+                            pass
                 # Keep status as running if no collector thread error has been recorded
                 if STATE.status != "stopped":
                     STATE.status = "running"
@@ -418,56 +503,7 @@ def api_live_metrics(limit: int = Query(default=50, ge=1, le=500)) -> list[dict[
     with STATE.lock:
         if not STATE.raw_rows:
             return []
-        raw_df = pd.DataFrame(STATE.raw_rows)
-
-    if raw_df.empty:
-        return []
-
-    raw_df["timestamp"] = pd.to_datetime(raw_df["timestamp"], errors="coerce")
-    raw_df = raw_df.sort_values("timestamp", ascending=False)
-    recent = raw_df.head(limit)
-
-    cols = [
-        "service_name", "stack", "timestamp", "ram_percent", "cpu_percent",
-        "heap_mb_used", "gc_count", "log_level", "log_message",
-        "hybrid_label", "raw_hybrid_label", "ground_truth_label", "failure_type",
-        "detection_layer", "log_template", "confidence",
-    ]
-    for c in cols:
-        if c not in recent.columns:
-            recent[c] = None
-
-    # Guarantee hybrid_label and failure_type are always populated for the dashboard
-    for idx, row in recent.iterrows():
-        lbl = row.get("hybrid_label")
-        if pd.isna(lbl) or lbl is None:
-            ram = float(row.get("ram_percent") or 0.0)
-            cpu = float(row.get("cpu_percent") or 0.0)
-            msg = str(row.get("log_message") or "").upper()
-            ram_thresh = getattr(pipeline, "RAM_FAILURE_THRESHOLD", 85.0)
-            is_fail = (
-                ram >= ram_thresh
-                or any(k in msg for k in getattr(pipeline, "MEMORY_KEYWORDS", []))
-            )
-            if is_fail:
-                recent.at[idx, "hybrid_label"] = "FAILURE"
-                ft = "none"
-                if ram >= ram_thresh or "OOM" in msg or "OUT OF MEMORY" in msg:
-                    ft = "oom"
-                elif "LEAK" in msg or ram >= ram_thresh * 0.85:
-                    ft = "memory_leak"
-                elif "GC" in msg or "OVERHEAD" in msg:
-                    ft = "gc_overhead"
-                else:
-                    ft = "memory_pressure"
-                recent.at[idx, "failure_type"] = ft
-                recent.at[idx, "detection_layer"] = "keyword"
-            else:
-                recent.at[idx, "hybrid_label"] = "NORMAL"
-                recent.at[idx, "failure_type"] = "none"
-                recent.at[idx, "detection_layer"] = "none"
-
-    return _df_to_records(recent[cols])
+        return list(STATE.raw_rows[:limit])
 
 
 @app.get("/api/windows")
@@ -711,8 +747,14 @@ async def ws_live(websocket: WebSocket) -> None:
     await websocket.accept()
     try:
         while True:
-            metrics = api_live_metrics()
-            await websocket.send_json({"type": "metrics_update", "data": metrics})
+            metrics = api_live_metrics(50)
+            with STATE.lock:
+                active_svcs = list(STATE.active_containers)
+            await websocket.send_json({
+                "type": "metrics_update",
+                "data": metrics,
+                "active_services": active_svcs,
+            })
 
             for row in metrics:
                 if row.get("hybrid_label") == "FAILURE":
@@ -726,8 +768,8 @@ async def ws_live(websocket: WebSocket) -> None:
                     }
                     await websocket.send_json(alert)
 
-            await asyncio.sleep(5)
-    except WebSocketDisconnect:
+            await asyncio.sleep(3)
+    except (WebSocketDisconnect, Exception):
         return
 
 

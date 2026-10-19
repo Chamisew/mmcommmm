@@ -16,7 +16,7 @@ class SyntheticSidecarHandler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self):
-        if self.path == "/ping":
+        if self.path in ("/ping", "/health"):
             self._send_json({"status": "ok", "synthetic": True, "language": self.stack})
             return
 

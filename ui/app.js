@@ -11,7 +11,7 @@ let isSimulating = false;
 let socket = null;
 let pollTimer = null;
 let configPollTimer = null;
-let configRefreshMs = Number(localStorage.getItem("c1_config_refresh_ms")) || 1000;
+let configRefreshMs = Number(localStorage.getItem("c1_config_refresh_ms")) || 5000;
 let configFileSnapshot = {};
 
 // Global State
@@ -34,13 +34,44 @@ let chartMemoryTrend = null;
 let chartHeapMemory = null;
 let chartTrend = null;
 
+// Render-cache: prevents flicker by skipping DOM writes when content is unchanged
+const _renderCache = new Map();
+function _setHTML(id, html) {
+  if (_renderCache.get(id) === html) return;
+  _renderCache.set(id, html);
+  const el = document.getElementById(id);
+  if (el) el.innerHTML = html;
+}
+function _setText(id, text) {
+  if (_renderCache.get(id + "\x00") === text) return;
+  _renderCache.set(id + "\x00", text);
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
+
 // Init Application on Load
 document.addEventListener("DOMContentLoaded", () => {
+  reorderSidebarNavigation();
   initCharts();
   initConfigurationPanel();
   connectBackend();
   pollTimer = setInterval(fetchBackendState, 3000);
 });
+
+function reorderSidebarNavigation() {
+  const nav = document.querySelector(".sidebar-nav");
+  if (!nav) return;
+
+  const itemsByTab = {};
+  Array.from(nav.querySelectorAll(".nav-item")).forEach(item => {
+    const match = item.getAttribute("onclick")?.match(/switchTab\('([^']+)'\)/);
+    if (match) itemsByTab[match[1]] = item;
+  });
+
+  ["overview", "configuration", "memory", "windows"].forEach(tabId => {
+    if (itemsByTab[tabId]) nav.appendChild(itemsByTab[tabId]);
+  });
+}
 
 // Connect to FastAPI backend REST & WebSocket
 function connectBackend() {
@@ -109,7 +140,7 @@ async function saveAzureService(event) {
     enabled: form.elements.enabled.checked
   };
   message.className = "settings-message";
-  message.textContent = "Verifying /ping and /metrics...";
+  message.textContent = "Verifying /metrics endpoint…";
   try {
     const response = await fetch(`${API_BASE}/api/azure-services`, {
       method: "POST",
@@ -161,8 +192,12 @@ function connectWebSocket() {
         if (msg.type === "metrics_update" && Array.isArray(msg.data)) {
           if (msg.data.length > 0) {
             pipelineData.raw_metrics = msg.data;
+            if (Array.isArray(msg.active_services) && msg.active_services.length > 0) {
+              pipelineData.active_services = msg.active_services;
+            }
             processMemoryData();
             updateOverview();
+            updateServiceFilterDropdown();
             renderStageData();
           }
         } else if (msg.type === "failure_alert") {
@@ -192,9 +227,9 @@ function switchTab(tabId) {
   currentTab = tabId;
 
   // Update sidebar nav active state
+  const tabIds = ["overview", "configuration", "memory", "windows"];
   document.querySelectorAll(".nav-item").forEach((nav, idx) => {
     nav.classList.remove("active");
-    const tabIds = ["overview", "memory", "alerts", "windows", "configuration"];
     if (idx < tabIds.length && tabIds[idx] === tabId) {
       nav.classList.add("active");
     }
@@ -205,7 +240,6 @@ function switchTab(tabId) {
   const paneMap = {
     "overview": "paneOverview",
     "memory": "paneMemory",
-    "alerts": "paneAlerts",
     "windows": "paneWindows",
     "configuration": "paneConfiguration"
   };
@@ -251,7 +285,7 @@ function applyConnectionSettings() {
   const urlInput = document.getElementById("configBackendUrl");
   const msInput = document.getElementById("configRefreshMs");
   const nextUrl = (urlInput?.value || DEFAULT_API_BASE).trim().replace(/\/$/, "");
-  const nextMs = Math.max(500, Number(msInput?.value) || 1000);
+  const nextMs = Math.max(2000, Number(msInput?.value) || 5000);
   API_BASE = nextUrl || DEFAULT_API_BASE;
   configRefreshMs = nextMs;
   localStorage.setItem("c1_backend_url", API_BASE);
@@ -267,7 +301,7 @@ async function reloadConfiguration() {
     const [configRes, statusRes, metricsRes] = await Promise.all([
       fetch(`${API_BASE}/api/services-config`),
       fetch(`${API_BASE}/api/status`),
-      fetch(`${API_BASE}/api/live-metrics?limit=500`)
+      fetch(`${API_BASE}/api/live-metrics?limit=100`)
     ]);
     if (!configRes.ok) throw new Error("Unable to load services_config.json");
     const fileConfig = await configRes.json();
@@ -358,43 +392,32 @@ function renderConfigurationView(fileConfig, statusData, metrics) {
     }
   }
 
-  const liveJson = buildLiveConfigPreview(fileConfig, enabledServices, activeSet, reportingSet);
-  const pre = document.getElementById("configJsonLive");
-  if (pre) pre.textContent = JSON.stringify(liveJson, null, 2);
+  // Live JSON preview — guarded to avoid textContent flash
+  const liveJsonStr = JSON.stringify(buildLiveConfigPreview(fileConfig, enabledServices, activeSet, reportingSet), null, 2);
+  _setText("configJsonLive", liveJsonStr);
 
-  const grid = document.getElementById("configDiscoveryGrid");
-  if (grid) {
-    if (!enabledServices.length) {
-      grid.innerHTML = '<p class="config-empty">No services in services_config.json yet. Use the gear icon in the header to add an Azure microservice.</p>';
-    } else {
-      grid.innerHTML = enabledServices.map(service => {
-        const name = service.name;
-        const platform = inferServicePlatform(service);
-        const meta = platformMeta(platform);
-        const isReporting = reportingSet.has(name);
-        const isDiscovered = activeSet.has(name) || configuredSet.has(name);
-        let statusLine = `${meta.label} · pending discovery`;
-        if (isReporting) statusLine = `${meta.label} · reporting telemetry`;
-        else if (isDiscovered) statusLine = `${meta.label} · discovered`;
-        const dotClass = isReporting || isDiscovered ? "ok" : "wait";
-        return `
-          <article class="config-service-card">
-            <div class="config-service-icon">${platformIconMarkup(meta)}</div>
-            <div class="config-service-body">
-              <div class="config-service-name">${escapeHtml(name)}</div>
-              <div class="config-service-status">${escapeHtml(statusLine)}</div>
-            </div>
-            <span class="config-service-dot ${dotClass}" title="${escapeHtml(statusLine)}"></span>
-          </article>
-        `;
-      }).join("");
-    }
+  // Discovery grid — guarded: skip innerHTML replacement when nothing changed
+  if (!enabledServices.length) {
+    _setHTML("configDiscoveryGrid", '<p class="config-empty">No services in services_config.json yet. Use the gear icon in the header to add an Azure microservice.</p>');
+  } else {
+    const gridHtml = enabledServices.map(service => {
+      const name = service.name;
+      const platform = inferServicePlatform(service);
+      const meta = platformMeta(platform);
+      const isReporting = reportingSet.has(name);
+      const isDiscovered = activeSet.has(name) || configuredSet.has(name);
+      let statusLine = `${meta.label} \u00b7 pending discovery`;
+      if (isReporting) statusLine = `${meta.label} \u00b7 reporting telemetry`;
+      else if (isDiscovered) statusLine = `${meta.label} \u00b7 discovered`;
+      const dotClass = isReporting || isDiscovered ? "ok" : "wait";
+      return `<article class="config-service-card"><div class="config-service-icon">${platformIconMarkup(meta)}</div><div class="config-service-body"><div class="config-service-name">${escapeHtml(name)}</div><div class="config-service-status">${escapeHtml(statusLine)}</div></div><span class="config-service-dot ${dotClass}" title="${escapeHtml(statusLine)}"></span></article>`;
+    }).join("");
+    _setHTML("configDiscoveryGrid", gridHtml);
   }
 
-  const footer = document.getElementById("configDiscoveryFooter");
-  if (footer) {
-    footer.innerHTML = `File: services_config.json &middot; ${configuredNames.length} service(s) &mdash; discovered: ${discoveredCount} &mdash; reporting: ${reportingCount}<br>Backend discovery_task re-reads this file every 10s; no restart needed.`;
-  }
+  // Footer — guarded
+  const footerHtml = `File: services_config.json &middot; ${configuredNames.length} service(s) &mdash; discovered: ${discoveredCount} &mdash; reporting: ${reportingCount}<br>Backend discovery_task re-reads this file every 10s; no restart needed.`;
+  _setHTML("configDiscoveryFooter", footerHtml);
 }
 
 function buildLiveConfigPreview(fileConfig, enabledServices, activeSet, reportingSet) {
@@ -450,13 +473,22 @@ function setTextContent(id, value) {
   if (el) el.textContent = value;
 }
 
-// Connect to FastAPI backend
+// Connect to FastAPI backend — all secondary requests fired in parallel with /api/status
 async function fetchBackendState() {
   try {
-    const resStatus = await fetch(`${API_BASE}/api/status`);
-    if (!resStatus.ok) throw new Error("Backend offline");
+    // Fire all requests simultaneously — do not block secondary fetches behind /api/status
+    const [resStatus, resMetrics, resTemplates, resWindows, resStats, resFeed] = await Promise.all([
+      fetch(`${API_BASE}/api/status`),
+      fetch(`${API_BASE}/api/live-metrics`).then(r => r.ok ? r.json() : []).catch(() => []),
+      fetch(`${API_BASE}/api/templates`).then(r => r.ok ? r.json() : []).catch(() => []),
+      fetch(`${API_BASE}/api/windows`).then(r => r.ok ? r.json() : []).catch(() => []),
+      fetch(`${API_BASE}/api/stats`).then(r => r.ok ? r.json() : {}).catch(() => ({})),
+      fetch(`${API_BASE}/api/component3/feed`).then(r => r.ok ? r.json() : { windows: [] }).catch(() => ({ windows: [] }))
+    ]);
 
+    if (!resStatus.ok) throw new Error("Backend offline");
     const statusData = await resStatus.json();
+
     const dot = document.getElementById("statusDot");
     const txt = document.getElementById("statusText");
     if (dot) dot.className = "status-dot";
@@ -480,14 +512,6 @@ async function fetchBackendState() {
     const simState = document.getElementById("simState");
     if (simState) simState.innerText = "OFF";
 
-    const [resMetrics, resTemplates, resWindows, resStats, resFeed] = await Promise.all([
-      fetch(`${API_BASE}/api/live-metrics`).then(r => r.json()).catch(() => []),
-      fetch(`${API_BASE}/api/templates`).then(r => r.json()).catch(() => []),
-      fetch(`${API_BASE}/api/windows`).then(r => r.json()).catch(() => []),
-      fetch(`${API_BASE}/api/stats`).then(r => r.json()).catch(() => ({})),
-      fetch(`${API_BASE}/api/component3/feed`).then(r => r.json()).catch(() => ({ windows: [] }))
-    ]);
-
     pipelineData.raw_metrics = resMetrics || [];
     pipelineData.templates = resTemplates || [];
     pipelineData.windows = resWindows || [];
@@ -501,17 +525,14 @@ async function fetchBackendState() {
     updateServiceFilterDropdown();
     renderStageData();
   } catch (err) {
-    if (!isSimulating) {
+    console.warn("fetchBackendState warning:", err.message);
+    if (isSimulating) {
+      updateMockStep();
+    } else {
       const dot = document.getElementById("statusDot");
       const txt = document.getElementById("statusText");
       if (dot) dot.className = "status-dot offline";
-      if (txt) txt.innerText = "Offline (Simulation)";
-      isSimulating = true;
-      const simState = document.getElementById("simState");
-      if (simState) simState.innerText = "ACTIVE";
-      generateMockTelemetry();
-    } else {
-      updateMockStep();
+      if (txt) txt.innerText = "Reconnecting...";
     }
   }
 }
@@ -802,37 +823,26 @@ function updateOverview() {
   const healthPercent = totalServices > 0 ? (healthyServices / totalServices) * 100 : 100;
   document.getElementById("healthBar").style.width = healthPercent + "%";
 
-  // Dynamic Active Services List
-  const servicesListEl = document.getElementById("servicesList");
-  if (servicesListEl) {
-    if (services.length === 0) {
-      servicesListEl.innerHTML = '<div class="empty-cell" style="padding:1rem;">Waiting for active services...</div>';
-    } else {
-      const latestBySvc = {};
-      pipelineData.raw_metrics.forEach(m => {
-        if (!latestBySvc[m.service_name]) latestBySvc[m.service_name] = m;
-      });
-      const avatarColors = ["blue", "purple", "orange", "teal", "red"];
-      servicesListEl.innerHTML = services.map((svcName, idx) => {
-        const m = latestBySvc[svcName] || {};
-        const stack = m.stack || "Microservice";
-        const initial = svcName.charAt(0).toUpperCase();
-        const color = avatarColors[idx % avatarColors.length];
-        const isAlert = m.hybrid_label === "FAILURE" || (m.ram_percent && m.ram_percent > 80);
-        const statusClass = isAlert ? "warning" : "active";
-        const meta = `${stack} • ${m.ram_percent != null ? m.ram_percent + "% RAM" : "Active"}`;
-        return `
-          <div class="service-item">
-            <div class="service-avatar ${color}">${initial}</div>
-            <div class="service-info">
-              <div class="service-name">${escapeHtml(svcName)}</div>
-              <div class="service-meta">${escapeHtml(meta)}</div>
-            </div>
-            <span class="service-status ${statusClass}" title="${isAlert ? 'Alert / High RAM' : 'Healthy'}"></span>
-          </div>
-        `;
-      }).join("");
-    }
+  // Dynamic Active Services List (guarded: skip write when content unchanged)
+  const avatarColors = ["blue", "purple", "orange", "teal", "red"];
+  if (services.length === 0) {
+    _setHTML("servicesList", '<div class="empty-cell" style="padding:1rem;">Waiting for active services...</div>');
+  } else {
+    const latestBySvc = {};
+    pipelineData.raw_metrics.forEach(m => {
+      if (!latestBySvc[m.service_name]) latestBySvc[m.service_name] = m;
+    });
+    const servicesHtml = services.map((svcName, idx) => {
+      const m = latestBySvc[svcName] || {};
+      const stack = m.stack || "Microservice";
+      const initial = svcName.charAt(0).toUpperCase();
+      const color = avatarColors[idx % avatarColors.length];
+      const isAlert = m.hybrid_label === "FAILURE" || (m.ram_percent && m.ram_percent > 80);
+      const statusClass = isAlert ? "warning" : "active";
+      const meta = `${stack} • ${m.ram_percent != null ? m.ram_percent + "% RAM" : "Active"}`;
+      return `<div class="service-item"><div class="service-avatar ${color}">${initial}</div><div class="service-info"><div class="service-name">${escapeHtml(svcName)}</div><div class="service-meta">${escapeHtml(meta)}</div></div><span class="service-status ${statusClass}" title="${isAlert ? 'Alert / High RAM' : 'Healthy'}"></span></div>`;
+    }).join("");
+    _setHTML("servicesList", servicesHtml);
   }
 
   // Update health items
@@ -874,51 +884,85 @@ function updateOverview() {
 function updateServiceFilterDropdown() {
   const sel = document.getElementById("serviceSelect");
   if (!sel) return;
-  const currVal = sel.value;
-  sel.innerHTML = '<option value="ALL">All Services</option>';
-  const services = pipelineData.active_services.length > 0
-    ? pipelineData.active_services
-    : Array.from(new Set(pipelineData.raw_metrics.map(m => m.service_name).filter(Boolean)));
-  services.forEach(svc => {
-    const opt = document.createElement("option");
-    opt.value = svc;
-    opt.innerText = svc;
-    if (svc === currVal) opt.selected = true;
-    sel.appendChild(opt);
-  });
+  const currVal = sel.value || "ALL";
+
+  const rawSvcs = (pipelineData.raw_metrics || []).map(m => m.service_name).filter(Boolean);
+  const activeSvcs = pipelineData.active_services || [];
+  const allServices = Array.from(new Set([...activeSvcs, ...rawSvcs])).sort();
+
+  const existingValues = Array.from(sel.options).map(o => o.value).filter(v => v !== "ALL");
+  const isSame = existingValues.length === allServices.length &&
+    existingValues.every((val, i) => val === allServices[i]);
+
+  if (!isSame) {
+    sel.innerHTML = '<option value="ALL">All Services</option>';
+    allServices.forEach(svc => {
+      const opt = document.createElement("option");
+      opt.value = svc;
+      opt.innerText = svc;
+      if (svc === currVal) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    if (currVal && Array.from(sel.options).some(o => o.value === currVal)) {
+      sel.value = currVal;
+    }
+  }
 }
 
 // Main Render Function for Active Tab
 function renderStageData() {
   const selectedSvc = document.getElementById("serviceSelect")?.value || "ALL";
-  let metrics = pipelineData.raw_metrics;
+  let metrics = pipelineData.raw_metrics || [];
   if (selectedSvc !== "ALL") {
     metrics = metrics.filter(m => m.service_name === selectedSvc);
   }
 
-  if (currentTab === "overview") {
-    // Overview is updated via updateOverview()
-  } else if (currentTab === "memory") {
+  // Always update memory trend chart live whenever filter or telemetry changes
+  try {
+    updateMemoryTrendChart(selectedSvc);
+  } catch (e) {
+    console.error("Error updating trend chart:", e);
+  }
+
+  // Always keep memory and windows tables populated with live data
+  try {
     renderMemoryTable(metrics);
-  } else if (currentTab === "alerts") {
-    renderAlertsDetail();
-    renderExplanations();
-  } else if (currentTab === "windows") {
+  } catch (e) {
+    console.error("Error rendering memory table:", e);
+  }
+
+  try {
     renderWindowsTable(selectedSvc);
+  } catch (e) {
+    console.error("Error rendering windows table:", e);
+  }
+
+  if (currentTab === "overview") {
+    const latestForSvc = metrics[0];
+    if (selectedSvc !== "ALL" && latestForSvc) {
+      if (latestForSvc.ram_percent != null) {
+        setTextContent("statAvgMemory", latestForSvc.ram_percent.toFixed(1) + "%");
+      }
+      if (latestForSvc.heap_mb_used != null) {
+        setTextContent("statHeapMemory", latestForSvc.heap_mb_used.toFixed(0) + " MB");
+      }
+      if (latestForSvc.gc_count != null) {
+        setTextContent("statGCCount", String(latestForSvc.gc_count));
+      }
+    }
   }
 }
 
 // Render memory usage table
 function renderMemoryTable(metrics) {
-  const tbody = document.getElementById("tableMemoryBody");
-  if (!tbody) return;
+  if (!document.getElementById("tableMemoryBody")) return;
 
   if (!metrics || metrics.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="5" class="empty-cell">No memory data available</td></tr>';
+    _setHTML("tableMemoryBody", '<tr><td colspan="5" class="empty-cell">No memory data available</td></tr>');
     return;
   }
 
-  tbody.innerHTML = metrics.slice(0, 25).map(m => {
+  const _memRows = metrics.slice(0, 25).map(m => {
     const isFail = m.hybrid_label === "FAILURE" || (m.ram_percent != null && m.ram_percent >= 85);
     const ramDisplay = m.ram_percent != null ? m.ram_percent + "%" : "N/A";
     const heapDisplay = m.heap_mb_used != null ? m.heap_mb_used + " MB" : "N/A";
@@ -935,61 +979,12 @@ function renderMemoryTable(metrics) {
       '<td>' + statusBadge + '</td>' +
       '</tr>';
   }).join("");
-}
-
-// Render alerts detail
-function renderAlertsDetail() {
-  const container = document.getElementById("alertsDetailList");
-  if (!container) return;
-
-  document.getElementById("alertCount").innerText = pipelineData.memory_alerts.length + " Active";
-
-  if (pipelineData.memory_alerts.length === 0) {
-    container.innerHTML = '<div class="empty-cell">No memory alerts detected</div>';
-    return;
-  }
-
-  container.innerHTML = pipelineData.memory_alerts.map(a => {
-    const t = (a.type || "").toLowerCase();
-    const alertClass = t.includes("oom") ? "" : (t.includes("leak") ? "warning" : "info");
-    const iconClass = t.includes("oom") ? "red" : (t.includes("leak") ? "orange" : "blue");
-    const displayType = (a.type || "MEMORY_ALERT").toUpperCase();
-    return '<div class="alert-item ' + alertClass + '">' +
-      '<div class="alert-icon ' + iconClass + '">' +
-      '<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>' +
-      '</div>' +
-      '<div class="alert-content">' +
-      '<div class="alert-title">' + escapeHtml(a.service) + ' — ' + escapeHtml(displayType) + '</div>' +
-      '<div class="alert-desc">RAM: ' + (a.ram_percent != null ? a.ram_percent + "%" : "N/A") + ' | Heap: ' + (a.heap_mb != null ? a.heap_mb + " MB" : "N/A") + ' | GC: ' + (a.gc_count != null ? a.gc_count : "N/A") + '</div>' +
-      '<div class="alert-meta">' + formatTime(a.timestamp) + ' | Detection: ' + escapeHtml(a.layer || "hybrid") + '</div>' +
-      '</div>' +
-      '</div>';
-  }).join("");
-}
-
-// Render explanations
-function renderExplanations() {
-  const container = document.getElementById("explanationsList");
-  if (!container) return;
-
-  if (pipelineData.explanations.length === 0) {
-    container.innerHTML = '<div class="empty-cell">No explanations available</div>';
-    return;
-  }
-
-  container.innerHTML = pipelineData.explanations.map(e => {
-    const displayType = (e.type || "MEMORY_ALERT").toUpperCase();
-    return '<div class="explanation-item">' +
-      '<div class="explanation-title">' + escapeHtml(e.service) + ' — ' + escapeHtml(displayType) + '</div>' +
-      '<div class="explanation-text">' + escapeHtml(e.explanation) + '</div>' +
-      '</div>';
-  }).join("");
+  _setHTML("tableMemoryBody", _memRows);
 }
 
 // Render windows table
 function renderWindowsTable(selectedSvc) {
-  const tbody = document.getElementById("tableWindowsBody");
-  if (!tbody) return;
+  if (!document.getElementById("tableWindowsBody")) return;
 
   let wins = pipelineData.windows;
   if (selectedSvc !== "ALL") {
@@ -997,11 +992,11 @@ function renderWindowsTable(selectedSvc) {
   }
 
   if (!wins || wins.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="5" class="empty-cell">No window data</td></tr>';
+    _setHTML("tableWindowsBody", '<tr><td colspan="5" class="empty-cell">No window data</td></tr>');
     return;
   }
 
-  tbody.innerHTML = wins.map(w => {
+  const _winRows = wins.map(w => {
     const slope = w.trend_slope_5m != null 
       ? w.trend_slope_5m.toFixed(3) 
       : (w.memory_growth != null ? (w.memory_growth > 0 ? "+" : "") + w.memory_growth.toFixed(1) + "%" : "0.000");
@@ -1017,11 +1012,105 @@ function renderWindowsTable(selectedSvc) {
       '<td>' + (isFail ? '<span class="badge badge-failure">FAILURE</span>' : '<span class="badge badge-normal">NORMAL</span>') + '</td>' +
       '</tr>';
   }).join("");
+  _setHTML("tableWindowsBody", _winRows);
 }
 
 // Filter logs based on search input
 function filterLogs() {
   renderStageData();
+}
+
+const SERVICE_COLORS = [
+  "#3b82f6", // blue
+  "#10b981", // emerald
+  "#f59e0b", // amber
+  "#a855f7", // purple
+  "#ec4899", // pink
+  "#06b6d4", // cyan
+  "#f43f5e", // rose
+  "#6366f1"  // indigo
+];
+
+function hexToRgba(hex, alpha) {
+  const c = hex.replace("#", "");
+  const r = parseInt(c.substring(0, 2), 16);
+  const g = parseInt(c.substring(2, 4), 16);
+  const b = parseInt(c.substring(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function updateMemoryTrendChart(selectedSvc) {
+  if (!chartMemoryTrend) return;
+  const metrics = pipelineData.raw_metrics || [];
+  if (metrics.length === 0) return;
+
+  const sel = selectedSvc || document.getElementById("serviceSelect")?.value || "ALL";
+
+  if (sel !== "ALL") {
+    // Focused single-service view
+    const filtered = metrics
+      .filter(m => m.service_name === sel)
+      .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+      .slice(-30);
+
+    if (filtered.length > 0) {
+      chartMemoryTrend.data.labels = filtered.map(m => formatTime(m.timestamp));
+      chartMemoryTrend.data.datasets = [{
+        label: `${sel} Memory Usage (%)`,
+        data: filtered.map(m => m.ram_percent != null ? m.ram_percent : 0),
+        borderColor: "#2563eb",
+        backgroundColor: "rgba(37, 99, 235, 0.15)",
+        fill: true,
+        tension: 0.35,
+        pointRadius: 4,
+        pointHoverRadius: 6,
+        borderWidth: 2
+      }];
+    } else {
+      chartMemoryTrend.data.labels = [];
+      chartMemoryTrend.data.datasets = [{
+        label: `${sel} (Waiting for telemetry...)`,
+        data: [],
+        borderColor: "#64748b",
+        backgroundColor: "transparent"
+      }];
+    }
+  } else {
+    // Multi-service view: separate clean line per service so data points do not collide
+    const sorted = [...metrics].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    const uniqueTimes = Array.from(new Set(sorted.map(m => formatTime(m.timestamp)))).slice(-20);
+
+    const services = Array.from(new Set(sorted.map(m => m.service_name).filter(Boolean)));
+    const datasets = services.map((svcName, idx) => {
+      const color = SERVICE_COLORS[idx % SERVICE_COLORS.length];
+      const timeToVal = {};
+      sorted.filter(m => m.service_name === svcName).forEach(m => {
+        timeToVal[formatTime(m.timestamp)] = m.ram_percent != null ? m.ram_percent : 0;
+      });
+
+      return {
+        label: svcName,
+        data: uniqueTimes.map(t => timeToVal[t] !== undefined ? timeToVal[t] : null),
+        borderColor: color,
+        backgroundColor: hexToRgba(color, 0.1),
+        fill: false,
+        tension: 0.35,
+        pointRadius: 3,
+        pointHoverRadius: 5,
+        borderWidth: 2,
+        spanGaps: true
+      };
+    });
+
+    chartMemoryTrend.data.labels = uniqueTimes;
+    chartMemoryTrend.data.datasets = datasets.length > 0 ? datasets : [{
+      label: "All Services Memory Usage (%)",
+      data: [],
+      borderColor: "#2563eb"
+    }];
+  }
+
+  chartMemoryTrend.update();
 }
 
 // Initialize Chart.js Instances
@@ -1062,26 +1151,29 @@ function initCharts() {
       type: "line",
       data: {
         labels: [],
-        datasets: [{
-          label: "Memory Usage (%)",
-          data: [],
-          borderColor: "#2563eb",
-          backgroundColor: "rgba(37, 99, 235, 0.1)",
-          fill: true,
-          tension: 0.4,
-          pointRadius: 4,
-          pointBackgroundColor: "#2563eb"
-        }]
+        datasets: []
       },
       options: {
         responsive: true,
         maintainAspectRatio: false,
+        interaction: {
+          mode: "index",
+          intersect: false
+        },
         scales: {
-          x: { ticks: { color: "#64748b", maxTicksLimit: 8 }, grid: { color: "rgba(0,0,0,0.06)" } },
-          y: { ticks: { color: "#64748b" }, grid: { color: "rgba(0,0,0,0.06)" }, beginAtZero: true, max: 100 }
+          x: { ticks: { color: "#94a3b8", maxTicksLimit: 8 }, grid: { color: "rgba(255,255,255,0.05)" } },
+          y: { ticks: { color: "#94a3b8" }, grid: { color: "rgba(255,255,255,0.05)" }, beginAtZero: true, max: 100 }
         },
         plugins: {
-          legend: { labels: { color: "#64748b" } }
+          legend: {
+            display: true,
+            position: "top",
+            labels: { color: "#cbd5e1", boxWidth: 12, padding: 8, font: { family: "Inter", size: 11 } }
+          },
+          tooltip: {
+            mode: "index",
+            intersect: false
+          }
         }
       }
     });
@@ -1146,15 +1238,11 @@ function initCharts() {
 function updateCharts() {
   const metrics = pipelineData.raw_metrics;
 
-  // Memory Trend Chart
-  if (chartMemoryTrend && metrics && metrics.length > 0) {
-    const sorted = [...metrics].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-    chartMemoryTrend.data.labels = sorted.map(m => formatTime(m.timestamp));
-    chartMemoryTrend.data.datasets[0].data = sorted.map(m => m.ram_percent || 0);
-    chartMemoryTrend.update();
-  }
+  // Memory Trend Chart with per-service filter
+  const selectedSvc = document.getElementById("serviceSelect")?.value || "ALL";
+  updateMemoryTrendChart(selectedSvc);
 
-  // Heap Memory Chart
+  // Heap Memory Chart — skip update if both old and new data are empty
   if (chartHeapMemory && metrics && metrics.length > 0) {
     const serviceHeap = {};
     metrics.forEach(m => {
@@ -1164,9 +1252,13 @@ function updateCharts() {
     });
     const labels = Object.keys(serviceHeap);
     const data = Object.values(serviceHeap);
-    chartHeapMemory.data.labels = labels;
-    chartHeapMemory.data.datasets[0].data = data;
-    chartHeapMemory.update();
+    const prevLabels = chartHeapMemory.data.labels || [];
+    const labelsChanged = labels.length !== prevLabels.length || labels.some((l, i) => l !== prevLabels[i]);
+    if (labelsChanged || data.some((v, i) => v !== (chartHeapMemory.data.datasets[0].data[i] || 0))) {
+      chartHeapMemory.data.labels = labels;
+      chartHeapMemory.data.datasets[0].data = data;
+      chartHeapMemory.update();
+    }
   }
 
   // Failure Trend Chart
@@ -1185,9 +1277,16 @@ function updateCharts() {
       trend = keys.map(k => ({ time: k, failures: minMap[k] }));
     }
     if (trend.length > 0) {
-      chartTrend.data.labels = trend.map(t => t.time);
-      chartTrend.data.datasets[0].data = trend.map(t => t.failures);
-      chartTrend.update();
+      const newLabels = trend.map(t => t.time);
+      const newData = trend.map(t => t.failures);
+      const prevData = chartTrend.data.datasets[0].data || [];
+      const changed = newLabels.length !== (chartTrend.data.labels || []).length ||
+        newData.some((v, i) => v !== prevData[i]);
+      if (changed) {
+        chartTrend.data.labels = newLabels;
+        chartTrend.data.datasets[0].data = newData;
+        chartTrend.update();
+      }
     }
   }
 
@@ -1219,4 +1318,66 @@ function escapeHtml(str) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
+}
+
+// Add a new service to the configuration
+async function addNewMicroservice() {
+  const nameInput = document.getElementById("newServiceName");
+  const urlInput = document.getElementById("newServiceUrl");
+  const messageEl = document.getElementById("newServiceMessage");
+
+  const name = nameInput.value.trim();
+  const url = urlInput.value.trim();
+
+  // Validation
+  if (!name) {
+    messageEl.innerHTML = '<span style="color:#dc2626;">Please enter a service name</span>';
+    return;
+  }
+  if (!url || !url.startsWith("http")) {
+    messageEl.innerHTML = '<span style="color:#dc2626;">Please enter a valid URL</span>';
+    return;
+  }
+
+  try {
+    messageEl.innerHTML = '<span style="color:#2563eb;">Connecting to backend...</span>';
+
+    const payload = {
+      name: name,
+      base_url: url,
+      enabled: true
+    };
+
+    const response = await fetch(`${API_BASE}/api/azure-services`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || "Unable to add service");
+
+    messageEl.innerHTML = '<span style="color:#16a34a;">' + escapeHtml(result.message || `Service "${name}" added successfully!`) + '</span>';
+
+    nameInput.value = "";
+    urlInput.value = "";
+
+    await fetchBackendState();
+    if (typeof reloadConfiguration === "function") reloadConfiguration();
+  } catch (err) {
+    messageEl.innerHTML = '<span style="color:#dc2626;">Error: ' + escapeHtml(err.message) + '</span>';
+  }
+}
+
+// Detect platform from URL pattern
+function detectPlatformFromUrl(url) {
+  const u = url.toLowerCase();
+  if (u.includes("python") || u.includes("flask") || u.includes("django")) return "python";
+  if (u.includes("node") || u.includes("express")) return "node";
+  if (u.includes("java") || u.includes("spring")) return "java";
+  if (u.includes("golang") || u.includes("-go")) return "go";
+  if (u.includes("dotnet") || u.includes("azure")) return "azure";
+  if (u.includes("php")) return "php";
+  if (u.includes("ruby") || u.includes("rails")) return "ruby";
+  return "generic";
 }

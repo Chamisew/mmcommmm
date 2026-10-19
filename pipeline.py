@@ -53,9 +53,14 @@ def load_failure_events():
         return pd.DataFrame(columns=["service_name", "failure_type", "start_time", "end_time"])
 
 
-def fill_ground_truth(df, failure_events):
+def fill_ground_truth(df, failure_events=None, mode="evaluation"):
     """Fill ground_truth_label column based on failure events.
-    FAILURE between start and end, NORMAL otherwise, UNKNOWN only if no entry for that service.
+    In Live mode:
+      Preserve ground_truth_label as UNKNOWN. Do not apply failure_events.csv.
+    In Evaluation mode:
+      Apply events only when their timestamps overlap the dataset timestamps.
+      FAILURE between start_time and end_time, NORMAL outside event windows for
+      services with overlapping events, UNKNOWN for services without overlapping events.
     """
     df = df.copy()
     if "ground_truth_label" not in df.columns:
@@ -63,25 +68,45 @@ def fill_ground_truth(df, failure_events):
     else:
         df["ground_truth_label"] = df["ground_truth_label"].fillna("UNKNOWN")
 
-    if failure_events is None or failure_events.empty:
+    if mode == "live" or failure_events is None or failure_events.empty:
         return df
 
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    if "timestamp" not in df.columns:
+        return df
+
+    df_ts = pd.to_datetime(df["timestamp"], errors="coerce")
+    valid_ts = df_ts.dropna()
+    if valid_ts.empty:
+        return df
+
+    dataset_start = valid_ts.min()
+    dataset_end = valid_ts.max()
+
+    services_with_overlapping_events = set()
 
     for _, event in failure_events.iterrows():
         svc = event["service_name"]
         start = event["start_time"]
         end = event["end_time"]
+        if pd.isna(start):
+            continue
+        if pd.isna(end):
+            end = start + pd.Timedelta(minutes=15)
+
+        # Check if this failure event overlaps with dataset timestamps
+        if start > dataset_end or end < dataset_start:
+            continue
+
+        services_with_overlapping_events.add(svc)
         mask = (
             (df["service_name"] == svc)
-            & (df["timestamp"] >= start)
-            & (df["timestamp"] <= end)
+            & (df_ts >= start)
+            & (df_ts <= end)
         )
         df.loc[mask, "ground_truth_label"] = "FAILURE"
 
-    # Fill NORMAL for services that have events but outside time windows
-    services_with_events = set(failure_events["service_name"].unique())
-    for svc in services_with_events:
+    # Fill NORMAL for services that have overlapping events, for rows outside failure windows
+    for svc in services_with_overlapping_events:
         svc_mask = df["service_name"] == svc
         unknown_mask = svc_mask & (df["ground_truth_label"] == "UNKNOWN")
         df.loc[unknown_mask, "ground_truth_label"] = "NORMAL"
@@ -89,31 +114,61 @@ def fill_ground_truth(df, failure_events):
     return df
 
 
-def compute_label_3state(df, failure_events):
+def compute_label_3state(df, failure_events=None, mode="evaluation"):
     """Compute label_3state: NORMAL, PRE_FAILURE (5-10 min before failure start), FAILURE.
-    Driven by ground-truth failure events.
+    In Live mode:
+      Do not calculate historical label_3state. Preserves existing or sets UNKNOWN.
+    In Evaluation mode:
+      Apply events only when their timestamps overlap the dataset timestamps.
+      Uses actual event end_time instead of hardcoded 15 minutes.
     """
     df = df.copy()
-    df["label_3state"] = "NORMAL"
+    if mode == "live":
+        if "label_3state" not in df.columns:
+            df["label_3state"] = "UNKNOWN"
+        return df
+
+    if "label_3state" not in df.columns:
+        df["label_3state"] = "NORMAL"
 
     if failure_events is None or failure_events.empty:
         return df
 
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    if "timestamp" not in df.columns:
+        return df
+
+    df_ts = pd.to_datetime(df["timestamp"], errors="coerce")
+    valid_ts = df_ts.dropna()
+    if valid_ts.empty:
+        return df
+
+    dataset_start = valid_ts.min()
+    dataset_end = valid_ts.max()
 
     for _, event in failure_events.iterrows():
         svc = event["service_name"]
         start = event["start_time"]
+        end = event["end_time"]
+        if pd.isna(start):
+            continue
+        if pd.isna(end):
+            end = start + pd.Timedelta(minutes=15)
+
+        pre_start = start - pd.Timedelta(minutes=10)
+        pre_end = start - pd.Timedelta(minutes=5)
+
+        # Check timestamp overlap with dataset
+        if pre_start > dataset_end or end < dataset_start:
+            continue
 
         svc_mask = df["service_name"] == svc
-        delta = (start - df["timestamp"]).dt.total_seconds()
 
         # PRE_FAILURE: 5-10 minutes before failure start
-        mask_pre = svc_mask & (delta > 5 * 60) & (delta <= 10 * 60)
+        mask_pre = svc_mask & (df_ts >= pre_start) & (df_ts <= pre_end)
         df.loc[mask_pre, "label_3state"] = "PRE_FAILURE"
 
-        # FAILURE: during the failure window
-        mask_fail = svc_mask & (delta <= 0) & (delta >= -(15 * 60))
+        # FAILURE: during actual failure window using event's actual start and end time
+        mask_fail = svc_mask & (df_ts >= start) & (df_ts <= end)
         df.loc[mask_fail, "label_3state"] = "FAILURE"
 
     return df
@@ -157,6 +212,7 @@ CONFIG = {
     # Live collection settings
     "live_duration_minutes"  : 1,
     "live_output_csv"        : "output/live_raw_collection.csv",
+    "mode"                   : os.environ.get("PIPELINE_MODE", "live"),
 }
 
 
@@ -391,12 +447,45 @@ def _print_dashboard(
         pass
 
 
-def load_azure_services():
-    """Loads service configurations.
+def _check_service_health(base_url: str, timeout: float = 3.0) -> tuple[bool, str]:
+    """
+    Safely check the health of a monitored service endpoint.
+    Tries GET {base_url}/health first.
+    If unavailable or returns a non-2xx status code, falls back to GET {base_url}/ping.
+    Treats any 2xx response as healthy.
+    Uses a short timeout (default 3.0s) and catches only requests.RequestException.
+    Returns (is_healthy: bool, detail: str).
+    """
+    clean_url = str(base_url).rstrip("/")
+
+    # 1. Try /health first
+    health_url = f"{clean_url}/health"
+    try:
+        resp = requests.get(health_url, timeout=timeout)
+        if 200 <= resp.status_code < 300:
+            return True, f"/health OK (HTTP {resp.status_code})"
+        health_err = f"/health returned HTTP {resp.status_code}"
+    except requests.RequestException as exc:
+        health_err = f"/health unreachable ({exc.__class__.__name__})"
+
+    # 2. Fallback to /ping
+    ping_url = f"{clean_url}/ping"
+    try:
+        resp = requests.get(ping_url, timeout=timeout)
+        if 200 <= resp.status_code < 300:
+            return True, f"/ping OK (HTTP {resp.status_code})"
+        return False, f"{health_err}; /ping returned HTTP {resp.status_code}"
+    except requests.RequestException as exc:
+        return False, f"{health_err}; /ping unreachable ({exc.__class__.__name__})"
+
+
+def load_monitored_services() -> dict[str, str]:
+    """Loads service configurations for monitored microservices.
+    Supports services hosted on Azure, Render, Oracle Cloud, or any reachable platform.
     Priority:
     1. JSON file 'services_config.json' (dynamically configured via UI)
     2. Local '.env' file containing KEY=VALUE pairs
-    3. Environment variables starting with 'AZURE_SERVICE_'
+    3. Environment variables starting with 'MONITORED_SERVICE_' or legacy 'AZURE_SERVICE_'
     Merges all sources so user-added services in services_config.json are always included.
     """
     services = {}
@@ -408,9 +497,9 @@ def load_azure_services():
             with open(config_file, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             for s in cfg.get("services", []):
-                if s.get("enabled", True) and s.get("base_url", "").startswith("http"):
-                    services[s["name"]] = s["base_url"].rstrip("/")
-        except Exception as e:
+                if s.get("enabled", True) and str(s.get("base_url", "")).startswith("http"):
+                    services[s["name"]] = str(s["base_url"]).rstrip("/")
+        except Exception:
             pass
 
     # 2. Try reading from a local .env file
@@ -423,12 +512,18 @@ def load_azure_services():
                     if line and not line.startswith("#") and "=" in line:
                         key, val = line.split("=", 1)
                         os.environ[key.strip()] = val.strip()
-        except Exception as e:
+        except Exception:
             pass
 
-    # 3. Check for environment variables (merge without discarding services_config.json)
+    # 3. Check for environment variables (both MONITORED_SERVICE_* and legacy AZURE_SERVICE_*)
     for env_name, env_val in os.environ.items():
-        if env_name.startswith("AZURE_SERVICE_") and env_val.startswith("http"):
+        if not env_val.startswith("http"):
+            continue
+        if env_name.startswith("MONITORED_SERVICE_"):
+            service_name = env_name.replace("MONITORED_SERVICE_", "").lower().replace("_", "-")
+            if service_name not in services:
+                services[service_name] = env_val.rstrip("/")
+        elif env_name.startswith("AZURE_SERVICE_"):
             service_name = env_name.replace("AZURE_SERVICE_", "").lower() + "-azure"
             if service_name not in services:
                 services[service_name] = env_val.rstrip("/")
@@ -436,7 +531,11 @@ def load_azure_services():
     return services
 
 
-def _detect_azure_stack(service_name: str, sidecar_lang: str) -> str:
+# Backward compatibility alias
+load_azure_services = load_monitored_services
+
+
+def _detect_service_stack(service_name: str, sidecar_lang: str) -> str:
     lang = (sidecar_lang or "").lower()
     if any(k in lang for k in ("python", "flask", "django", "fastapi")):
         return "Python/Flask"
@@ -452,6 +551,8 @@ def _detect_azure_stack(service_name: str, sidecar_lang: str) -> str:
         return "PHP/FPM"
     if any(k in lang for k in ("ruby", "rails", "puma")):
         return "Ruby/Puma"
+    if any(k in lang for k in ("swift", "vapor")):
+        return "Swift/Vapor"
     
     # Fallback to name-based detection
     cname = (service_name or "").lower()
@@ -469,10 +570,16 @@ def _detect_azure_stack(service_name: str, sidecar_lang: str) -> str:
         return "PHP/FPM"
     if "ruby" in cname:
         return "Ruby/Puma"
-    return "Unknown"
+    if "swift" in cname or "vapor" in cname:
+        return "Swift/Vapor"
+    return "Microservice"
 
 
-def _collect_azure_sidecar(
+# Backward compatibility alias
+_detect_azure_stack = _detect_service_stack
+
+
+def _collect_service_metrics(
     service_name: str,
     base_url: str,
     duration_seconds: int,
@@ -484,7 +591,8 @@ def _collect_azure_sidecar(
     service_status: dict,
 ) -> None:
     """
-    Collect metrics from a single Azure sidecar service every `interval_seconds`.
+    Collect metrics from a single monitored service every `interval_seconds`.
+    Queries GET {base_url}/metrics with existing timeout behavior.
     """
     gc_cumulative = 0
     start_time = time.monotonic()
@@ -496,7 +604,7 @@ def _collect_azure_sidecar(
         tick_start = time.monotonic()
         
         try:
-            resp = requests.get(f"{base_url}/metrics", timeout=8.0)
+            resp = requests.get(f"{base_url}/metrics", timeout=(5.0, 15.0))
             if resp.status_code == 200:
                 data = resp.json()
                 
@@ -514,6 +622,10 @@ def _collect_azure_sidecar(
                 cpu_percent = float(cpu_raw or 0.0)
 
                 ram_raw = data.get("memory_percent")
+                if ram_raw is None:
+                    ram_raw = data.get("memory_usage_percent")
+                if ram_raw is None:
+                    ram_raw = data.get("ram_percent")
                 if ram_raw is None:
                     ram_raw = mem.get("container_memory_percent")
                 if ram_raw is None:
@@ -560,7 +672,7 @@ def _collect_azure_sidecar(
                         or mem.get("language")
                         or ""
                     )
-                    stack = _detect_azure_stack(service_name, sidecar_lang)
+                    stack = _detect_service_stack(service_name, sidecar_lang)
                 
                 # GC detection from real log message only (skip if empty)
                 if log_message and _has_gc_keyword(log_message):
@@ -646,14 +758,14 @@ def _collect_azure_sidecar(
             else:
                 # Mark service as offline
                 service_status[service_name] = False
-                print(f"  [WARN] /metrics for Azure service '{service_name}' returned HTTP status {resp.status_code}")
+                print(f"  [WARN] /metrics for monitored service '{service_name}' returned HTTP status {resp.status_code}")
                 with results_lock:
                     warning_counter[0] += 1
                     
         except Exception as exc:
             # Mark service as offline
             service_status[service_name] = False
-            print(f"  [WARN] Network error fetching metrics for Azure service '{service_name}': {exc}")
+            print(f"  [WARN] Network error fetching metrics for monitored service '{service_name}': {exc}")
             with results_lock:
                 error_counter[0] += 1
                 
@@ -661,14 +773,18 @@ def _collect_azure_sidecar(
         time.sleep(max(0, interval_seconds - elapsed))
 
 
+# Backward compatibility alias
+_collect_azure_sidecar = _collect_service_metrics
+
+
 # =============================================================================
-# STAGE 1 — LIVE AZURE SIDECAR COLLECTOR
+# STAGE 1 — LIVE MONITORED SERVICES COLLECTOR
 # =============================================================================
-def stage1_collect_azure_sidecar(duration_minutes: int = 10) -> pd.DataFrame:
+def stage1_collect_monitored_services(duration_minutes: int = 10) -> pd.DataFrame:
     """
-    Discover all configured Azure microservices via env / .env / services_config.json.
-    Verify they are active by pinging {base_url}/ping.
-    For all active ones, spawn threads to poll {base_url}/metrics every 5 seconds.
+    Discover all configured monitored microservices via services_config.json / env.
+    Verify initial reachability via _check_service_health() (/health then /ping fallback).
+    For all configured services, spawn threads to poll {base_url}/metrics every 5 seconds.
     Periodically runs preprocessing, Drain3, Classifier, and Sliding Windows.
     """
     INTERVAL_SEC = 5
@@ -676,27 +792,24 @@ def stage1_collect_azure_sidecar(duration_minutes: int = 10) -> pd.DataFrame:
     PROCESS_INTERVAL_SEC = 30
 
     print("\n" + "="*60)
-    print("STAGE 1 — LIVE AZURE SIDECAR COLLECTOR")
+    print("STAGE 1 — LIVE MONITORED SERVICES COLLECTOR")
     print("="*60)
     print(f"  Duration   : {duration_minutes} minutes ({DURATION_SEC if DURATION_SEC > 0 else 'infinite'}s)")
     print(f"  Interval   : every {INTERVAL_SEC} seconds")
 
     # Discover microservices
-    all_services = load_azure_services()
+    all_services = load_monitored_services()
     with pipeline_state_lock:
         pipeline_state["configured_services"] = list(all_services.keys())
 
-    print(f"\n  Checking configuration for {len(all_services)} Azure service(s):")
+    print(f"\n  Checking configuration for {len(all_services)} monitored service(s):")
     discovered_services = dict(all_services)
     for name, base_url in all_services.items():
-        try:
-            resp = requests.get(f"{base_url}/ping", timeout=3.0)
-            if resp.status_code == 200:
-                print(f"    • {name:<35} UP -> {base_url}")
-            else:
-                print(f"    • {name:<35} returned status {resp.status_code} (will retry in background)")
-        except Exception as exc:
-            print(f"    • {name:<35} initial check: {exc} (will retry in background)")
+        is_healthy, detail = _check_service_health(base_url, timeout=3.0)
+        if is_healthy:
+            print(f"    • {name:<35} UP -> {base_url} ({detail})")
+        else:
+            print(f"    • {name:<35} initial check: {detail} (will retry in background)")
 
     # Shared state
     results_list = []
@@ -709,7 +822,7 @@ def stage1_collect_azure_sidecar(duration_minutes: int = 10) -> pd.DataFrame:
     # Spawn collector threads
     for name, base_url in discovered_services.items():
         t = threading.Thread(
-            target=_collect_azure_sidecar,
+            target=_collect_service_metrics,
             args=(
                 name,
                 base_url,
@@ -727,7 +840,7 @@ def stage1_collect_azure_sidecar(duration_minutes: int = 10) -> pd.DataFrame:
         t.start()
         active_threads[name] = t
 
-    print(f"\n  Started {len(active_threads)} Azure sidecar collector thread(s). Collecting …\n")
+    print(f"\n  Started {len(active_threads)} monitored service collector thread(s). Collecting …\n")
 
     # Dashboard and pipeline loop
     collection_start = time.monotonic()
@@ -751,7 +864,7 @@ def stage1_collect_azure_sidecar(duration_minutes: int = 10) -> pd.DataFrame:
 
             if (now - last_print_time) >= INTERVAL_SEC:
                 # Dynamic discovery: reload services from services_config.json & env without restarting
-                current_services = load_azure_services()
+                current_services = load_monitored_services()
                 with pipeline_state_lock:
                     pipeline_state["configured_services"] = list(current_services.keys())
 
@@ -761,7 +874,7 @@ def stage1_collect_azure_sidecar(duration_minutes: int = 10) -> pd.DataFrame:
                         discovered_services[name] = base_url
                         service_status[name] = True
                         new_t = threading.Thread(
-                            target=_collect_azure_sidecar,
+                            target=_collect_service_metrics,
                             args=(
                                 name,
                                 base_url,
@@ -778,7 +891,7 @@ def stage1_collect_azure_sidecar(duration_minutes: int = 10) -> pd.DataFrame:
                         )
                         new_t.start()
                         active_threads[name] = new_t
-                        print(f"  [DYNAMIC DISCOVERY] Started collector thread for Azure service '{name}' ({base_url})")
+                        print(f"  [DYNAMIC DISCOVERY] Started collector thread for monitored service '{name}' ({base_url})")
 
                 for name in list(discovered_services.keys()):
                     if name not in current_services:
@@ -821,7 +934,7 @@ def stage1_collect_azure_sidecar(duration_minutes: int = 10) -> pd.DataFrame:
                 active_c = len(set(r["service_name"] for r in snapshot_copy))
                 print(
                     f"  [{int(elapsed)}s] "
-                    f"Azure Services: {active_c} | "
+                    f"Monitored Services: {active_c} | "
                     f"Rows: {n_rows} | "
                     f"RAM avg: {ram_avg:.1f}%"
                 )
@@ -858,9 +971,12 @@ def stage1_collect_azure_sidecar(duration_minutes: int = 10) -> pd.DataFrame:
 
                         processed_df = stage1_5_preprocess(raw_snapshot_df)
                         if not processed_df.empty:
-                            # Fill ground truth from failure events
-                            failure_events = load_failure_events()
-                            processed_df = fill_ground_truth(processed_df, failure_events)
+                            # Live mode: preserve ground_truth_label as UNKNOWN (do not apply failure_events.csv)
+                            if "ground_truth_label" not in processed_df.columns:
+                                processed_df["ground_truth_label"] = "UNKNOWN"
+                            else:
+                                processed_df["ground_truth_label"] = processed_df["ground_truth_label"].fillna("UNKNOWN")
+
                             # Update per-service baselines from healthy rows
                             _update_service_baselines(processed_df)
                             # Run pipeline stages
@@ -868,22 +984,21 @@ def stage1_collect_azure_sidecar(duration_minutes: int = 10) -> pd.DataFrame:
                             processed_df = stage3_hybrid_classifier(processed_df, CONFIG)
                             windows_df_partial = stage4_sliding_window(processed_df, CONFIG)
                             if windows_df_partial is not None and not windows_df_partial.empty:
-                                failure_events = load_failure_events()
-                                if "label_3state" not in windows_df_partial.columns:
-                                    windows_df_partial = compute_label_3state(windows_df_partial, failure_events)
-                                windows_df_partial = continuous_save(windows_df_partial, CONFIG)
+                                # Live mode: do not calculate historical label_3state
+                                windows_df_partial = continuous_save(windows_df_partial, CONFIG, is_live=True)
                         else:
                             windows_df_partial = pd.DataFrame()
 
                         failure_count = 0
                         normal_count = 0
                         if windows_df_partial is not None and not windows_df_partial.empty:
-                            if "ground_truth_label" in windows_df_partial.columns:
+                            # In live mode: detector results come from hybrid_label
+                            if "hybrid_label" in windows_df_partial.columns:
                                 failure_count = int(
-                                    (windows_df_partial["ground_truth_label"] == "FAILURE").sum()
+                                    (windows_df_partial["hybrid_label"] == "FAILURE").sum()
                                 )
                                 normal_count = int(
-                                    (windows_df_partial["ground_truth_label"] == "NORMAL").sum()
+                                    (windows_df_partial["hybrid_label"] == "NORMAL").sum()
                                 )
 
                         with pipeline_state_lock:
@@ -915,14 +1030,14 @@ def stage1_collect_azure_sidecar(duration_minutes: int = 10) -> pd.DataFrame:
                         pipeline_state["status"] = "collecting"
                         pipeline_state["last_updated"] = datetime.now()
                 finally:
-                    next_process_time += PROCESS_INTERVAL_SEC
+                    next_process_time = time.monotonic() + PROCESS_INTERVAL_SEC
 
             time.sleep(0.5)
     except KeyboardInterrupt:
         print("\n  [INFO] Live collection interrupted by user! Saving data collected so far...")
 
     # Wait for all threads to finish
-    for t in threads:
+    for t in active_threads.values():
         t.join(timeout=INTERVAL_SEC + 2)
 
     # Build DataFrame
@@ -952,11 +1067,15 @@ def stage1_collect_azure_sidecar(duration_minutes: int = 10) -> pd.DataFrame:
     df.to_csv(raw_csv_path, index=False)
     print(f"  Raw collection saved -> {raw_csv_path}")
 
-    print("\n  [STAGE 1 LIVE AZURE COMPLETE]")
+    print("\n  [STAGE 1 LIVE MONITORED SERVICES COMPLETE]")
     with pipeline_state_lock:
         pipeline_state["status"] = "ready"
         pipeline_state["last_updated"] = datetime.now()
     return df
+
+
+# Backward compatibility alias
+stage1_collect_azure_sidecar = stage1_collect_monitored_services
 
 
 # =============================================================================
@@ -1385,7 +1504,12 @@ def _update_service_baselines(df):
     if df is None or df.empty:
         return
     for svc, grp in df.groupby("service_name"):
-        healthy = grp[grp.get("ground_truth_label", pd.Series(["NORMAL"] * len(grp))) == "NORMAL"] if "ground_truth_label" in grp.columns else grp
+        if "ground_truth_label" in grp.columns and (grp["ground_truth_label"] == "NORMAL").any():
+            healthy = grp[grp["ground_truth_label"] == "NORMAL"]
+        elif "hybrid_label" in grp.columns and (grp["hybrid_label"] == "NORMAL").any():
+            healthy = grp[grp["hybrid_label"] == "NORMAL"]
+        else:
+            healthy = grp
         if len(healthy) < 100:
             # Not enough data — use fixed fallbacks until 100 healthy rows exist
             _service_metric_baselines[svc] = {
@@ -1775,14 +1899,17 @@ def stage4_sliding_window(df, config):
                 # Use ground truth when known, otherwise fall back to hybrid_label
                 if (window["ground_truth_label"] == "FAILURE").any():
                     window_label = "FAILURE"
+                    label_source = "ground_truth"
                 elif (window["ground_truth_label"] == "NORMAL").all():
                     window_label = "NORMAL"
+                    label_source = "ground_truth"
                 else:
                     window_label = (
                         "FAILURE"
                         if (window["hybrid_label"] == "FAILURE").any()
                         else "NORMAL"
                     )
+                    label_source = "hybrid_classifier"
 
                 rec = {
                     "window_id"          : window_id,
@@ -1808,7 +1935,7 @@ def stage4_sliding_window(df, config):
                     "hybrid_label"       : current["hybrid_label"],
                     "raw_hybrid_label"   : current.get("raw_hybrid_label", "UNKNOWN"),
                     "ground_truth_label" : current["ground_truth_label"],
-                    "label_source"       : "ground_truth",
+                    "label_source"       : label_source,
                     "detection_layer"    : current["detection_layer"],
                     "failure_type"       : current["failure_type"],
                     "confidence"         : current.get("confidence"),
@@ -1875,7 +2002,44 @@ def get_project_id(service_name=None, stack_name=None):
         _NEXT_PROJECT_ID += 1
     return _SERVICE_PROJECT_MAP[key]
 
-def continuous_save(windows_df, config):
+
+def init_persistent_state(output_dir: str = None) -> None:
+    """Initialize or reset persistent state (project IDs, window counter) from existing output CSVs."""
+    global _SERVICE_PROJECT_MAP, _NEXT_PROJECT_ID
+    if output_dir is None:
+        output_dir = CONFIG.get("output_dir", "output/")
+    ml_csv = os.path.join(output_dir, "ml_ready_dataset.csv")
+    pipe_csv = os.path.join(output_dir, "pipeline_output.csv")
+
+    _SERVICE_PROJECT_MAP = {}
+    _NEXT_PROJECT_ID = 1
+    max_id = 0
+
+    target_csv = ml_csv if os.path.exists(ml_csv) else (pipe_csv if os.path.exists(pipe_csv) else None)
+    if target_csv and os.path.exists(target_csv):
+        try:
+            df = pd.read_csv(target_csv)
+            if not df.empty:
+                if "window_id" in df.columns:
+                    valid_ids = pd.to_numeric(df["window_id"], errors="coerce").dropna()
+                    if not valid_ids.empty:
+                        max_id = int(valid_ids.max())
+                if "service_name" in df.columns and "project_id" in df.columns:
+                    for _, row in df[["service_name", "project_id"]].dropna().drop_duplicates().iterrows():
+                        svc = str(row["service_name"]).strip()
+                        pid = str(row["project_id"]).strip()
+                        if svc and pid:
+                            _SERVICE_PROJECT_MAP[svc] = pid
+                            m = re.match(r"project_(\d+)", pid)
+                            if m:
+                                _NEXT_PROJECT_ID = max(_NEXT_PROJECT_ID, int(m.group(1)) + 1)
+        except Exception:
+            pass
+
+    with pipeline_state_lock:
+        pipeline_state["last_window_id"] = max_id
+
+def continuous_save(windows_df, config, is_live=True):
     """
     Append only new windows to pipeline_output.csv and ml_ready_dataset.csv.
     Newness is determined by monotonic window_id.
@@ -1897,9 +2061,13 @@ def continuous_save(windows_df, config):
         )
         windows_df["label"] = windows_df["hybrid_label"]
 
-        if "label_3state" not in windows_df.columns:
-            failure_events = load_failure_events()
-            windows_df = compute_label_3state(windows_df, failure_events)
+        mode = config.get("mode", "live" if is_live else "evaluation").lower()
+        if mode == "evaluation" and not is_live:
+            if "label_3state" not in windows_df.columns:
+                failure_events = load_failure_events()
+                windows_df = compute_label_3state(windows_df, failure_events, mode="evaluation")
+        elif "label_3state" not in windows_df.columns:
+            windows_df["label_3state"] = "UNKNOWN"
 
         windows_df = add_incident_phase_flags(windows_df)
         windows_df = add_incident_phase_columns(windows_df)
@@ -2130,16 +2298,21 @@ def add_incident_phase_columns(df):
 add_risk_phase_columns = add_incident_phase_columns
 
 
-def build_ml_dataframe(windows_df):
+def build_ml_dataframe(windows_df, mode=None):
     """Build the ML-ready dataframe with the canonical feature schema."""
+    if mode is None:
+        mode = CONFIG.get("mode", "live").lower()
     enriched = windows_df.copy()
     enriched = add_ram_std_trend(enriched)
     enriched = add_memory_change_features(enriched)
     enriched = add_incident_phase_columns(enriched)
 
-    failure_events = load_failure_events()
-    if "label_3state" not in enriched.columns:
-        enriched = compute_label_3state(enriched, failure_events)
+    if mode == "evaluation":
+        failure_events = load_failure_events()
+        if "label_3state" not in enriched.columns:
+            enriched = compute_label_3state(enriched, failure_events, mode="evaluation")
+    elif "label_3state" not in enriched.columns:
+        enriched["label_3state"] = "UNKNOWN"
 
     if "confidence" not in enriched.columns:
         enriched["confidence"] = 0.5
@@ -2325,10 +2498,14 @@ def stage5_export(windows_df, config):
         windows_df["project_id"] = windows_df["stack"].apply(get_project_id)
         windows_df["label"] = windows_df["hybrid_label"]
 
-        # Compute 3-state label driven by ground-truth failure events
-        failure_events = load_failure_events()
-        if "label_3state" not in windows_df.columns:
-            windows_df = compute_label_3state(windows_df, failure_events)
+        # Compute 3-state label driven by ground-truth failure events (evaluation mode only)
+        mode = config.get("mode", "live").lower()
+        if mode == "evaluation":
+            failure_events = load_failure_events()
+            if "label_3state" not in windows_df.columns:
+                windows_df = compute_label_3state(windows_df, failure_events, mode="evaluation")
+        elif "label_3state" not in windows_df.columns:
+            windows_df["label_3state"] = "UNKNOWN"
 
         windows_df = add_incident_phase_flags(windows_df)
         windows_df = add_incident_phase_columns(windows_df)
@@ -2338,7 +2515,7 @@ def stage5_export(windows_df, config):
         windows_df[pipeline_cols].to_csv(out1, index=False)
         print(f"  pipeline_output.csv   -> {out1}  ({len(windows_df):,} rows)")
 
-        ml_df = build_ml_dataframe(windows_df)
+        ml_df = build_ml_dataframe(windows_df, mode=mode)
 
         ml_df.to_csv(out2, index=False)
         print(f"  ml_ready_dataset.csv  -> {out2}  ({len(ml_df):,} rows)")
@@ -2354,7 +2531,7 @@ def stage5_export(windows_df, config):
 # =============================================================================
 # EVALUATION REPORT
 # =============================================================================
-def print_evaluation(windows_df, raw_df):
+def print_evaluation(windows_df, raw_df=None):
     """
     Print comprehensive evaluation: F1/Precision/Recall, confusion matrix,
     layer contribution, per-service F1, template stats, dataset stats.
@@ -2362,6 +2539,12 @@ def print_evaluation(windows_df, raw_df):
     print("\n" + "="*60)
     print("EVALUATION REPORT")
     print("="*60)
+
+    has_gt = "ground_truth_label" in windows_df.columns and windows_df["ground_truth_label"].isin(["FAILURE", "NORMAL"]).any()
+    if not has_gt:
+        print("\n  [NOTE] Evaluation skipped: ground_truth_label is UNKNOWN for this dataset.")
+        print("  Ground truth failure events must overlap the dataset timestamps to compute metrics.")
+        return
 
     y_true = (windows_df["ground_truth_label"] == "FAILURE").astype(int)
     y_pred = (windows_df["hybrid_label"]        == "FAILURE").astype(int)
@@ -2441,6 +2624,8 @@ def print_evaluation(windows_df, raw_df):
     print(f"   {'Feature':<20} {'Min':>10}  {'Mean':>10}  {'Max':>10}")
     print(f"   {'-'*55}")
     for col in feature_cols:
+        if col not in windows_df.columns:
+            continue
         mn  = windows_df[col].min()
         avg = windows_df[col].mean()
         mx  = windows_df[col].max()
@@ -2937,6 +3122,12 @@ def measure_early_warning_time(windows_df):
         print("\n  [EARLY WARNING ANALYSIS SKIPPED]")
         return
 
+    has_gt_failures = (work_df["ground_truth_label"] == "FAILURE").any()
+    if not has_gt_failures:
+        print("  [NOTE] No ground truth FAILURE events found in dataset.")
+        print("\n  [EARLY WARNING ANALYSIS SKIPPED]")
+        return
+
     early_warning_minutes = []
     event_records = []
 
@@ -3032,24 +3223,95 @@ def measure_early_warning_time(windows_df):
 
 
 # =============================================================================
+# HISTORICAL EVALUATION MODE
+# =============================================================================
+def run_evaluation_mode(windows_df=None, raw_df=None, failure_events=None, config=None):
+    """
+    Historical Evaluation Mode:
+    1. Loads failure_events.csv.
+    2. Applies events ONLY when their timestamps overlap the dataset timestamps.
+    3. Computes ground_truth_label, label_3state (with actual end_time), and metrics.
+    4. Runs evaluation report and early-warning analysis.
+    """
+    print("\n" + "="*60)
+    print("HISTORICAL EVALUATION MODE")
+    print("="*60)
+
+    cfg = dict(CONFIG if config is None else config)
+    cfg["mode"] = "evaluation"
+
+    if failure_events is None:
+        failure_events = load_failure_events()
+
+    if windows_df is None:
+        out_pipeline = os.path.join(cfg.get("output_dir", "output/"), "pipeline_output.csv")
+        if os.path.exists(out_pipeline):
+            try:
+                windows_df = pd.read_csv(out_pipeline)
+                print(f"  Loaded windows dataset from {out_pipeline} ({len(windows_df)} rows)")
+            except Exception as e:
+                print(f"  [ERROR] Failed to load {out_pipeline}: {e}")
+                return None
+        else:
+            print("  [ERROR] No dataset provided and pipeline_output.csv does not exist.")
+            return None
+
+    if windows_df.empty:
+        print("  [WARN] Dataset is empty. Evaluation skipped.")
+        return windows_df
+
+    eval_df = fill_ground_truth(windows_df, failure_events, mode="evaluation")
+    eval_df = compute_label_3state(eval_df, failure_events, mode="evaluation")
+
+    has_gt = eval_df["ground_truth_label"].isin(["FAILURE", "NORMAL"]).any()
+    if not has_gt:
+        print("  [NOTE] No ground-truth failure events overlap with this dataset's timestamp range.")
+        if "timestamp" in eval_df.columns:
+            ts = pd.to_datetime(eval_df["timestamp"], errors="coerce").dropna()
+            if not ts.empty:
+                print(f"  Dataset range : {ts.min()} to {ts.max()}")
+        if failure_events is not None and not failure_events.empty:
+            print(f"  Events range  : {failure_events['start_time'].min()} to {failure_events['end_time'].max()}")
+        print("  ground_truth_label remains UNKNOWN. Historical metrics cannot be computed.")
+        print("="*60 + "\n")
+        return eval_df
+
+    print_evaluation(eval_df, raw_df if raw_df is not None else eval_df)
+    measure_early_warning_time(eval_df)
+    return eval_df
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
 def main():
-    print("\n" + "#"*60)
-    print("# MEMORY FAILURE DETECTION PIPELINE")
-    print("# Stack-Agnostic Log Parsing + Hybrid Feature Extraction")
-    print("#"*60)
-    print("# MODE: Azure Sidecar Collector")
-    print("#"*60)
-
     # Change working directory to the script's location
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(script_dir)
 
+    mode = os.environ.get("PIPELINE_MODE", CONFIG.get("mode", "live")).lower()
+    if "--eval" in sys.argv or mode == "evaluation":
+        print("\n" + "#"*60)
+        print("# MEMORY FAILURE DETECTION PIPELINE")
+        print("# Stack-Agnostic Log Parsing + Hybrid Feature Extraction")
+        print("#"*60)
+        print("# MODE: Historical Evaluation Mode")
+        print("#"*60)
+        run_evaluation_mode()
+        print("\n[PIPELINE FINISHED SUCCESSFULLY]\n")
+        return
+
+    print("\n" + "#"*60)
+    print("# MEMORY FAILURE DETECTION PIPELINE")
+    print("# Stack-Agnostic Log Parsing + Hybrid Feature Extraction")
+    print("#"*60)
+    print("# MODE: Monitored Services Collector (Live Mode)")
+    print("#"*60)
+
     # -------------------------------------------------------------------------
-    # Stage 1 — Ingest from Azure HTTP Sidecars
-    df = stage1_collect_azure_sidecar(
+    # Stage 1 — Ingest from HTTP Monitored Services
+    df = stage1_collect_monitored_services(
         duration_minutes=CONFIG["live_duration_minutes"]
     )
 
@@ -3075,8 +3337,9 @@ def main():
     # Stage 5 — Export CSVs
     windows_df = stage5_export(windows_df, CONFIG)
 
-    # Evaluation (only meaningful when ground_truth labels are real)
-    print("\n  [NOTE] Evaluation skipped (ground_truth_label is UNKNOWN for Azure live collection).")
+    # Evaluation notice for live mode
+    print("\n  [NOTE] Live mode complete: detector results available in hybrid_label.")
+    print("  ground_truth_label is UNKNOWN for live collection. Run with --eval or mode='evaluation' for historical evaluation.")
 
     print("\n[PIPELINE FINISHED SUCCESSFULLY]\n")
 

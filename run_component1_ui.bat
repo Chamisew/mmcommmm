@@ -4,7 +4,7 @@ setlocal EnableDelayedExpansion
 
 set COMP1=%~dp0
 echo ============================================================
-echo   Component 1: Log Ingestion & Memory Failure Pipeline UI
+echo   Component 1: Log Ingestion ^& Memory Failure Pipeline UI
 echo   Root: %COMP1%
 echo ============================================================
 echo.
@@ -20,7 +20,7 @@ if not exist "%VENV%\Scripts\python.exe" (
     "%VENV%\Scripts\python.exe" -m pip install -r "%COMP1%requirements.txt" --quiet
 )
 
-echo [INFO] Starting Component 1 Ingestion API & Process Explorer UI on port 8001...
+echo [INFO] Starting Component 1 Ingestion API ^& Process Explorer UI on port 8001...
 start "COMP1 - Process Explorer :8001" cmd /k "cd /d "%COMP1%" && "%VENV%\Scripts\python.exe" -m uvicorn app:app --host 0.0.0.0 --port 8001 --reload"
 
 echo [INFO] Waiting for server to initialize...
